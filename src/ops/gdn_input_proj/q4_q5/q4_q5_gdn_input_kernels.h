@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "core/arena.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include <cuda_runtime.h>
@@ -30,5 +31,11 @@ void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight
                                         const Tensor& initial_slot, Tensor& conv_record,
                                         Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                         cudaStream_t stream);
+
+// Int8-activation prefill route (LinearPolicy AllowA8/AllowA4, T >= kQ4Q5Q8MinTokens); allocates
+// the quantized activations from ws.
+void q4_q5_gdn_input_q8_launch(const Tensor& x, const Weight& qk_weight,
+                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                               WorkspaceArena& ws, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

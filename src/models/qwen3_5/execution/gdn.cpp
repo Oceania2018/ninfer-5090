@@ -18,7 +18,8 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
         return ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, single->policy,
                                                             first, last);
     }
-    return 0;
+    const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
+    return ops::gdn_input_proj_workspace_capacity_bytes(pair.policy, first, last);
 }
 
 std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
@@ -35,6 +36,10 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
+        if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+            bytes += ops::gdn_input_proj_workspace_capacity_bytes(
+                pair->policy, batch * first_width, batch * last_width);
+        }
     }
     // The native overlap contract takes a disjoint span even for a zero-scratch fused route.
     return std::max(std::size_t{1}, bytes);
@@ -54,6 +59,10 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
+        if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+            bytes += ops::gdn_input_proj_workspace_capacity_bytes(
+                pair->policy, batch * first_width, batch * last_width);
+        }
     }
     return std::max(std::size_t{1}, bytes);
 }
@@ -61,7 +70,8 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, stream);
+        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, pair->policy, workspace,
+                            stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);
@@ -94,7 +104,8 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, pair->first, pair->second, parameters.convolution,
                                           conv_states, valid_columns, initial_slots,
-                                          destination_slots, query, key, value, z, scratch, stream);
+                                          destination_slots, query, key, value, z, pair->policy,
+                                          scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_snapshot(
@@ -114,7 +125,7 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, z, scratch, stream);
+                                        query, key, value, z, pair->policy, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_record(hidden, single.weight, parameters.convolution, conv_states,

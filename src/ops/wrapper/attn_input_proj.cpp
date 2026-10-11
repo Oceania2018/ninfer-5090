@@ -1,3 +1,5 @@
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
+#include "ops/common/q8_act.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
@@ -208,9 +210,35 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }
 
+std::size_t attn_input_proj_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
+    }
+    return allows_a8(policy) && max_tokens >= detail::kQ4Q5Q8MinTokens
+               ? detail::q8_act_workspace_bytes(5120, max_tokens)
+               : 0;
+}
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
+    attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
+                    nullptr, stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, policy, &workspace,
+                    stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -223,6 +251,11 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 
+    if (workspace != nullptr && allows_a8(policy) && cols >= detail::kQ4Q5Q8MinTokens) {
+        detail::q4_q5_attn_input_q8_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                           *workspace, stream);
+        return;
+    }
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);
 }

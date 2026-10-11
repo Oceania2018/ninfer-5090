@@ -127,6 +127,14 @@ ninfer_add_op_test(ninfer_gdn_replay_fold_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_q4_q5_int8_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_q5_int8_proj.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_iq3_xxs_mlp_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/iq3_xxs/test_iq3_xxs_mlp.cpp"
+  LIBRARIES ninfer_ops)
+
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")

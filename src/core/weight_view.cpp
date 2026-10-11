@@ -142,6 +142,17 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::Iq3XxsPlanar) {
+        // llama.cpp IQ3_XXS blocks split into planes: 96 code bytes per 256 columns, then the
+        // binary16 block scales.
+        if (format != QType::IQ3_XXS || k % 256) {
+            throw std::invalid_argument("IQ3_XXS planar requires K%256=0");
+        }
+        out.group_size          = 256;
+        out.code_bytes_per_row  = mul(k / 256, 96);
+        out.scale_bytes_per_row = mul(k / 256, 2);
+        out.code_bytes          = mul(n, out.code_bytes_per_row);
+        out.scale_offset        = aligned(out.code_bytes, 256);
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
@@ -275,7 +286,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
-    if (g.layout == QuantLayout::RowSplit) {
+    if (g.layout == QuantLayout::RowSplit || g.layout == QuantLayout::Iq3XxsPlanar) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
         out.scale_ne[1] = out.n;

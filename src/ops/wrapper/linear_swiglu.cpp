@@ -4,6 +4,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/iq3_xxs/iq3_xxs_linear_swiglu.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
@@ -55,6 +56,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::IQ3_XXS && detail::iq3_xxs_linear_swiglu_admits(gate_up_rows, input_rows)) {
+        return allows_a8(policy) ? detail::iq3_xxs_linear_swiglu_workspace_bytes(max_tokens) : 0;
+    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -104,13 +108,24 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
+    const bool iq3_weight   = large_shape && gate_up_weight.qtype == QType::IQ3_XXS;
+    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !iq3_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
     if (fp8_weight) {
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
         detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
+    }
+
+    if (iq3_weight) {
+        // Planar code rows are 1920 bytes; the GEMV reads 8-byte index groups.
+        if (!aligned_to(gate_up_weight.qdata, 16) || !aligned_to(gate_up_weight.scales, 2)) {
+            throw std::invalid_argument("linear_swiglu: IQ3_XXS code/scale alignment is missing");
+        }
+        detail::iq3_xxs_linear_swiglu_dispatch(x, gate_up_weight, out, allows_a8(policy), ws,
+                                               stream);
         return;
     }
 

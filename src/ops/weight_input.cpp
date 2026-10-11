@@ -144,7 +144,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto second = single(inputs.last<2>());
     require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
             "input projection: paired native form requires Q4 and Q5");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first.weight, second.weight, common_policy(inputs)};
 }
 
 } // namespace

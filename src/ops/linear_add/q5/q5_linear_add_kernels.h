@@ -1,6 +1,7 @@
 #pragma once
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "core/arena.h"
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
@@ -17,4 +18,6 @@ void q5_linear_add_sliced_r32_t64_w2_s1_launch(const Tensor&, const Weight&, Ten
 void q5_linear_add_mma_r32_t32_k128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_mma_r32_t128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void q5_linear_add_mma_r64_t128_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void q5_linear_add_q8_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                             WorkspaceArena& ws, cudaStream_t stream);
 } // namespace ninfer::ops::detail

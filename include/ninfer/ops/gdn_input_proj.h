@@ -40,6 +40,34 @@ namespace ninfer::ops {
  * Workspace:
  *   No transient bytes are required.
  */
+/*
+ * Paired Q4/Q5 form with an activation policy: AllowA8/AllowA4 lets prefill (T >= 64) quantize x
+ * to int8 in `workspace` (gdn_input_proj_workspace_capacity_bytes(policy, ...) bytes, on top of any
+ * conv scratch). The pointer overload accepts nullptr workspace, which keeps BF16 activations.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(LinearPolicy policy,
+                                                                  std::int32_t min_tokens,
+                                                                  std::int32_t max_tokens);
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream);
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena* workspace,
+                    cudaStream_t stream);
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy,
+                                  WorkspaceArena& ws, cudaStream_t stream);
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream);
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 

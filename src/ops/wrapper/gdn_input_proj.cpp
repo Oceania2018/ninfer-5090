@@ -1,3 +1,4 @@
+#include "ops/common/q8_act.h"
 #include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -694,8 +695,32 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 
 } // namespace
 
+std::size_t gdn_input_proj_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
+    }
+    return allows_a8(policy) && max_tokens >= detail::kQ4Q5Q8MinTokens
+               ? detail::q8_act_workspace_bytes(5120, max_tokens)
+               : 0;
+}
+
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
+    gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, policy, &workspace, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena* workspace,
+                    cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -710,6 +735,11 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
 
+    if (workspace != nullptr && allows_a8(policy) && cols >= detail::kQ4Q5Q8MinTokens) {
+        detail::q4_q5_gdn_input_q8_launch(x, qk_weight, value_z_weight, qkv, z, *workspace,
+                                          stream);
+        return;
+    }
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
@@ -885,6 +915,18 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
+    gdn_input_proj_conv_snapshot(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                                 valid_columns, initial_state_slots, snapshot_base_slots, query,
+                                 key, value, z, LinearPolicy::A16Only, ws, stream);
+}
+
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy,
+                                  WorkspaceArena& ws, cudaStream_t stream) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -911,7 +953,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
+                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, policy, ws,
+                               stream);
             });
         return;
     }
@@ -927,7 +970,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
-    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, policy, ws, stream);
     detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                valid_columns, initial_state_slots,
                                                snapshot_base_slots, query, key, value, stream);
@@ -939,6 +982,18 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    gdn_input_proj_conv_record(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                               valid_columns, initial_state_slots, conv_record, query, key, value,
+                               z, LinearPolicy::A16Only, workspace, stream);
+}
+
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -976,7 +1031,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
+                                      policy, workspace, stream);
                    });
 }
 

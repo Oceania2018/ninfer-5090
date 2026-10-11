@@ -24,6 +24,7 @@ struct SingleProjectionWeight {
 
 struct PairedProjectionWeights {
     Weight first, second;
+    LinearPolicy policy = LinearPolicy::A16Only; // common policy of the paired uses
 };
 
 using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;

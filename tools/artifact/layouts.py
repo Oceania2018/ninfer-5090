@@ -17,6 +17,7 @@ from typing import Sequence
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
+    Iq3XxsFormat,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
@@ -94,6 +95,12 @@ ROW_SCALE_V1 = Layout(
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
 
+IQ3_XXS_PLANAR_V1 = Layout(
+    "iq3_xxs_planar_v1",
+    256,
+    frozenset(("iq3_xxs",)),
+)
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -102,6 +109,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            IQ3_XXS_PLANAR_V1,
         )
     }
 )
@@ -246,6 +254,49 @@ def row_scale_geometry(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class Iq3XxsGeometry:
+    n: int
+    k: int
+    blocks_per_row: int
+    code_row_bytes: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+IQ3_XXS_BLOCK_CODE_BYTES = 96
+
+
+def iq3_xxs_geometry(
+    format: str | Iq3XxsFormat, shape: Sequence[int]
+) -> Iq3XxsGeometry:
+    """Code plane of [N, K/256, 96] bytes, then the [N, K/256] binary16 block scales."""
+
+    spec = _format(format)
+    if not isinstance(spec, Iq3XxsFormat):
+        raise ValueError("iq3_xxs_planar_v1 requires IQ3_XXS")
+    n, k = _shape(shape, rank=2)
+    if k % spec.block_size != 0:
+        raise ValueError("iq3_xxs_planar_v1 requires K divisible by 256")
+    blocks = k // spec.block_size
+    code_row_bytes = blocks * IQ3_XXS_BLOCK_CODE_BYTES
+    code_plane_bytes = n * code_row_bytes
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * blocks * 2
+    return Iq3XxsGeometry(
+        n=n,
+        k=k,
+        blocks_per_row=blocks,
+        code_row_bytes=code_row_bytes,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -276,4 +327,6 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is IQ3_XXS_PLANAR_V1:
+        return iq3_xxs_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

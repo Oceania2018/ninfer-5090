@@ -30,6 +30,20 @@ namespace ninfer::ops {
  * Current registered routes require no transient allocation. The Op has no persistent state side
  * effect.
  */
+/*
+ * Paired Q4/Q5 form with an activation policy: AllowA8/AllowA4 lets prefill (T >= 64) quantize x
+ * to int8 in `workspace` (attn_input_proj_workspace_capacity_bytes(policy, ...) bytes). The
+ * pointer overload accepts nullptr workspace, which keeps BF16 activations.
+ */
+[[nodiscard]] std::size_t attn_input_proj_workspace_capacity_bytes(LinearPolicy policy,
+                                                                   std::int32_t min_tokens,
+                                                                   std::int32_t max_tokens);
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream);

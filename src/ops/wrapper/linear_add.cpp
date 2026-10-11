@@ -1,3 +1,5 @@
+#include "ops/common/q8_act.h"
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
@@ -7,11 +9,13 @@
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
+#include "ops/linear_add/iq3_xxs/iq3_xxs_linear_add.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -112,8 +116,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return 0;
     }
     if (qtype == QType::Q5_G64_FP16) {
-        return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
-                                                              min_tokens, max_tokens);
+        const std::size_t a16 = detail::q5_linear_add_capacity_workspace_bytes(
+            output_rows, input_rows, input_rows, min_tokens, max_tokens);
+        const bool a8 = allows_a8(policy) && output_rows == 5120 && input_rows == 6144 &&
+                        max_tokens >= detail::kQ4Q5Q8MinTokens;
+        return std::max(a16, a8 ? detail::q8_act_workspace_bytes(input_rows, max_tokens) : 0);
     }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
@@ -136,6 +143,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         }
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
+    }
+    if (qtype == QType::IQ3_XXS) {
+        if (!detail::iq3_xxs_linear_add_admits(output_rows, input_rows)) {
+            throw std::invalid_argument("linear_add workspace: unsupported IQ3_XXS profile");
+        }
+        return allows_a8(policy) ? detail::iq3_xxs_linear_add_workspace_bytes(max_tokens) : 0;
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
@@ -192,6 +205,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
+        if (allows_a8(policy) && w.k == 6144 && x.ne[1] >= detail::kQ4Q5Q8MinTokens) {
+            detail::q5_linear_add_q8_launch(x, w, residual_out, ws, stream);
+            return;
+        }
         detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
         return;
     }
@@ -240,6 +257,18 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::IQ3_XXS) {
+        if (w.layout != QuantLayout::Iq3XxsPlanar || !detail::iq3_xxs_linear_add_admits(w.n, w.k)) {
+            throw std::invalid_argument("linear_add: unsupported IQ3_XXS weight");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
+            !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 2)) {
+            throw std::invalid_argument("linear_add: IQ3_XXS requires 16-byte x/residual/code alignment");
+        }
+        detail::iq3_xxs_linear_add_dispatch(x, w, residual_out, allows_a8(policy), ws, stream);
         return;
     }
 
