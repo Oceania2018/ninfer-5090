@@ -585,7 +585,13 @@ __global__ __launch_bounds__(WM * 32, MB) void iq3xxs_q8_mma_kernel(
         const float* ss          = reinterpret_cast<const float*>(xs + L::kX);
         const std::uint8_t* xrow = xs + gid * kIq3XxsQ8XRowBytes + (lid >> 1) * 16 + (lid & 1) * 8;
         const float* srow        = ss + lid * 2;
+        // Software-pipelined: each MMA of sub-block s is issued next to the integer scaling of
+        // sub-block s - 1 (whose products wait in prev), so the tensor pipe is fed while the IMADs
+        // run instead of in bursts. Integer partials stay per block (SG == 8).
+        static_assert(SG == 8, "the pipelined loop accumulates whole blocks");
         int iacc[MT][NT][4];
+        int prev[MT][NT][4];
+        int fprev[MT][2];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             unsigned a[MT][4];
@@ -615,31 +621,42 @@ __global__ __launch_bounds__(WM * 32, MB) void iq3xxs_q8_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
                     int p0 = 0, p1 = 0, p2 = 0, p3 = 0;
                     mma_s8(p0, p1, p2, p3, a[mi][0], a[mi][1], a[mi][2], a[mi][3], xb.x, xb.y);
-                    if (s % SG == 0) {
-                        iacc[mi][ni][0] = p0 * f[mi][0];
-                        iacc[mi][ni][1] = p1 * f[mi][0];
-                        iacc[mi][ni][2] = p2 * f[mi][1];
-                        iacc[mi][ni][3] = p3 * f[mi][1];
-                    } else {
-                        iacc[mi][ni][0] += p0 * f[mi][0];
-                        iacc[mi][ni][1] += p1 * f[mi][0];
-                        iacc[mi][ni][2] += p2 * f[mi][1];
-                        iacc[mi][ni][3] += p3 * f[mi][1];
+                    if (s == 1) {
+                        iacc[mi][ni][0] = prev[mi][ni][0] * fprev[mi][0];
+                        iacc[mi][ni][1] = prev[mi][ni][1] * fprev[mi][0];
+                        iacc[mi][ni][2] = prev[mi][ni][2] * fprev[mi][1];
+                        iacc[mi][ni][3] = prev[mi][ni][3] * fprev[mi][1];
+                    } else if (s > 1) {
+                        iacc[mi][ni][0] += prev[mi][ni][0] * fprev[mi][0];
+                        iacc[mi][ni][1] += prev[mi][ni][1] * fprev[mi][0];
+                        iacc[mi][ni][2] += prev[mi][ni][2] * fprev[mi][1];
+                        iacc[mi][ni][3] += prev[mi][ni][3] * fprev[mi][1];
                     }
+                    prev[mi][ni][0] = p0;
+                    prev[mi][ni][1] = p1;
+                    prev[mi][ni][2] = p2;
+                    prev[mi][ni][3] = p3;
                 }
             }
-            if (s % SG == SG - 1) {
 #pragma unroll
-                for (int ni = 0; ni < NT; ++ni) {
-                    const float2 xs2 = *reinterpret_cast<const float2*>(srow + (s / SG) * BN + ni * 8);
+            for (int mi = 0; mi < MT; ++mi) {
+                fprev[mi][0] = f[mi][0];
+                fprev[mi][1] = f[mi][1];
+            }
+        }
 #pragma unroll
-                    for (int mi = 0; mi < MT; ++mi) {
-                        acc[mi][ni][0] = fmaf(static_cast<float>(iacc[mi][ni][0]), dq[mi][0] * xs2.x, acc[mi][ni][0]);
-                        acc[mi][ni][1] = fmaf(static_cast<float>(iacc[mi][ni][1]), dq[mi][0] * xs2.y, acc[mi][ni][1]);
-                        acc[mi][ni][2] = fmaf(static_cast<float>(iacc[mi][ni][2]), dq[mi][1] * xs2.x, acc[mi][ni][2]);
-                        acc[mi][ni][3] = fmaf(static_cast<float>(iacc[mi][ni][3]), dq[mi][1] * xs2.y, acc[mi][ni][3]);
-                    }
-                }
+        for (int ni = 0; ni < NT; ++ni) {
+            const float2 xs2 = *reinterpret_cast<const float2*>(srow + ni * 8);
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                const int v0 = iacc[mi][ni][0] + prev[mi][ni][0] * fprev[mi][0];
+                const int v1 = iacc[mi][ni][1] + prev[mi][ni][1] * fprev[mi][0];
+                const int v2 = iacc[mi][ni][2] + prev[mi][ni][2] * fprev[mi][1];
+                const int v3 = iacc[mi][ni][3] + prev[mi][ni][3] * fprev[mi][1];
+                acc[mi][ni][0] = fmaf(static_cast<float>(v0), dq[mi][0] * xs2.x, acc[mi][ni][0]);
+                acc[mi][ni][1] = fmaf(static_cast<float>(v1), dq[mi][0] * xs2.y, acc[mi][ni][1]);
+                acc[mi][ni][2] = fmaf(static_cast<float>(v2), dq[mi][1] * xs2.x, acc[mi][ni][2]);
+                acc[mi][ni][3] = fmaf(static_cast<float>(v3), dq[mi][1] * xs2.y, acc[mi][ni][3]);
             }
         }
         if (more) {
