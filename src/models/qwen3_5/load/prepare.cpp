@@ -3,8 +3,31 @@
 #include "artifact/views.h"
 
 #include <cmath>
+#include <variant>
 
 namespace ninfer::models::qwen3_5::loading {
+
+#if defined(NINFER_SM86)
+namespace {
+
+// True when every object backing the parameter is a format whose A8 route is the int8
+// (q8_act + mma.s8) path rather than FP8/TMA.
+bool sm89_int8_activation_format(artifact::Binder& binder,
+                                 const artifact::ParameterReference& reference) {
+    if (reference.binding.parts.empty()) { return false; }
+    for (const auto& part : reference.binding.parts) {
+        const auto& object = binder.reader().directory().object(part.object);
+        const auto* tensor = std::get_if<artifact::TensorObject>(&object);
+        if (tensor == nullptr || (tensor->format != "iq3_xxs" && tensor->format != "q4_g64_fp16" &&
+                                  tensor->format != "q5_g64_fp16")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+#endif
 
 WeightUseId Bindings::use(WeightId id, std::string_view input) const {
     const auto& parameter = at(id);
@@ -35,11 +58,17 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
             result.policy = ops::LinearPolicy::A16Only;
             break;
 #if defined(NINFER_SM86)
-        // Fork-local (rtx4090-port): the A8 (FP8) and A4 (NVFP4) routes load through TMA or use
-        // E2M1 block-scale MMA, which sm_89 lacks. Those weights run their A16 routes instead.
+        // Fork-local (rtx4090-port): the FP8 A8 and NVFP4 A4 routes load through TMA or use E2M1
+        // block-scale MMA, which sm_89 lacks, so those weights run their A16 routes. The IQ3_XXS
+        // and Q4/Q5 group-64 A8 routes quantize activations to int8 and contract with
+        // mma.m16n8k32.s8 over cp.async (sm_80+), so they run as AllowA8 for prefill. AllowA4
+        // uses get the same int8 route: artifacts that copy the NVFP4 package's policies tag the
+        // dense MLP AllowA4, and A4 is a superset of A8.
         case artifact::ActivationPolicy::AllowA8:
         case artifact::ActivationPolicy::AllowA4:
-            result.policy = ops::LinearPolicy::A16Only;
+            result.policy = sm89_int8_activation_format(binder, pending.reference)
+                                ? ops::LinearPolicy::AllowA8
+                                : ops::LinearPolicy::A16Only;
             break;
 #else
         case artifact::ActivationPolicy::AllowA8:
