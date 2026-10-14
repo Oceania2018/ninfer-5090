@@ -63,6 +63,10 @@ Bf16TmaDescriptors make_bf16_tma_descriptors(const Bf16A16Operands& p) {
 template <class Schedule>
 __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorMap* map,
                                               int k_sector, int row, std::uint64_t* barrier) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Fork-local: TMA needs sm_90. sm_89 builds route BF16 TMA schedules to the MMA kernel.
+    __trap();
+#else
     if constexpr (bf16_predicated_k<Schedule>) {
         asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                      "[%0], [%1, {%2, %3}], [%4];"
@@ -78,6 +82,7 @@ __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorM
                        "r"(smem_addr(barrier))
                      : "memory");
     }
+#endif
 }
 
 template <class Schedule, class Epilogue>
@@ -147,9 +152,28 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
                                                token_begin, rows, token_offset + count, warp, lane);
 }
 
+#if defined(NINFER_SM86)
+// Fork-local (rtx4090-port): sm_89 has no TMA. A TMA schedule keeps its tile geometry and runs on
+// the cp.async MMA kernel: no producer warp, no barrier storage, the cp.async swizzle.
+template <class Schedule>
+struct Bf16TmaOnCpAsync : Schedule {
+    static constexpr Bf16MmaSwizzle kSwizzle = Bf16MmaSwizzle::Xor64;
+    static constexpr int kThreads            = Schedule::kWarps * 32;
+    static constexpr int kSharedBytes =
+        Schedule::kSharedElements * static_cast<int>(sizeof(__nv_bfloat16));
+};
+
+template <class Schedule, class Output, class Epilogue>
+void launch_bf16_a16_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
+                         cudaStream_t stream);
+#endif
+
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                              cudaStream_t stream) {
+#if defined(NINFER_SM86)
+    launch_bf16_a16_mma<Bf16TmaOnCpAsync<Schedule>>(p, output, epilogue, stream);
+#else
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
@@ -173,6 +197,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
         else
             launch.template operator()<false>();
     });
+#endif
 }
 
 } // namespace ninfer::ops::detail

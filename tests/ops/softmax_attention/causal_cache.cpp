@@ -2762,6 +2762,15 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         if (selected && storage != *selected) continue;
+#ifdef NINFER_SM86
+        // sm_89 refuses NVFP4 and K8V4 KV at startup (E2M1 pack, TMA, setmaxnreg).
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            std::cout << "SKIP causal_softmax_attention " << cache_name(storage)
+                      << " (requires compute capability 12.0)" << std::endl;
+            continue;
+        }
+#endif
         const auto start = std::chrono::steady_clock::now();
         std::cout << "RUN causal_softmax_attention " << cache_name(storage) << std::endl;
         const int current = run_storage_cases(execution, storage);
