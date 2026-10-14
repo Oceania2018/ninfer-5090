@@ -449,6 +449,15 @@ public:
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
     void skip_capture(SequenceHandle sequence);
+    // log p(id | prompt) for each candidate at the completed prompt frontier of this sequence,
+    // normalized over the public vocabulary; out-of-vocabulary ids report -infinity.
+    [[nodiscard]] std::vector<float> score_tail(SequenceHandle sequence,
+                                                std::span<const TokenId> candidates);
+    // For each branch, log p(id | prompt + branch) for every candidate, branch-major. Branches are
+    // evaluated from the completed prompt frontier without changing the sequence's KV or state.
+    [[nodiscard]] std::vector<float>
+    score_branches(SequenceHandle sequence, std::span<const std::vector<TokenId>> branches,
+                   std::span<const TokenId> candidates);
     // Finite physical actions, each including every optional holder needed for its release.
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
                                                   std::span<const CheckpointHandle> excluded,

@@ -36,6 +36,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/target_logprobs.h"
 
 #include <cuda_runtime.h>
 
@@ -795,6 +796,103 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                              sink);
 }
 
+void TextContext::score_branch_batch(const Tensor& ids, const Tensor& cache_positions,
+                                     const Tensor& rope_positions, const Tensor& valid_columns,
+                                     const Tensor& kv_table_rows,
+                                     const Tensor& linear_state_source_slots,
+                                     ops::CausalAttentionExecutionEnvelope envelope,
+                                     std::span<const std::int32_t> last_columns,
+                                     const Tensor& targets, std::int32_t candidates,
+                                     std::int32_t vocabulary, Tensor& logprobs) {
+    const std::int32_t width = ids.ne[0];
+    const std::int32_t batch = ids.ne[1];
+    if (width < 2 || batch <= 0 || static_cast<std::size_t>(batch) != last_columns.size() ||
+        candidates <= 0 || targets.dtype != DType::I32 || logprobs.dtype != DType::FP32 ||
+        targets.ne[0] < batch || targets.ne[1] < candidates || logprobs.ne[0] != targets.ne[0] ||
+        logprobs.ne[1] < candidates) {
+        throw std::invalid_argument("score branch batch shape is outside its buffers");
+    }
+    if (!config_.gdn) { throw std::logic_error("score branch batch requires GDN layers"); }
+    const std::int32_t columns = width * batch;
+    require_tensor_shape(ids, DType::I32, {width, batch}, "score branch ids");
+    require_tensor_shape(cache_positions, DType::I32, {width, batch},
+                         "score branch cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {width, batch}, "score branch RoPE positions");
+    require_tensor_shape(valid_columns, DType::I32, {batch}, "score branch valid columns");
+    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "score branch KV rows");
+    require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
+                         "score branch Linear Attention slots");
+
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    {
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
+        ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
+                                                 &linear_state_source_slots);
+        ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+
+        // Scoring never replays its transitions, so every layer and every row group writes its
+        // ReplaySSM records into one throwaway set (the planner mirrors this allocation order).
+        const auto& gdn       = *config_.gdn;
+        const std::int32_t group = std::min(batch, kScoreBranchGroup);
+        GdnReplayRecords records;
+        records.spec = GdnReplayRecordSpec{
+            .layers          = 1,
+            .record_capacity = group,
+            .width           = width,
+            .conv_channels   = dimension(gdn.conv_channels()),
+            .qk_heads        = dimension(gdn.linear_num_key_heads),
+            .value_heads     = dimension(gdn.linear_num_value_heads),
+            .key_dim         = dimension(gdn.linear_key_head_dim),
+            .value_dim       = dimension(gdn.linear_value_head_dim),
+        };
+        records.conv  = work_.alloc(DType::BF16, {records.spec.conv_channels, width, group});
+        records.key   = work_.alloc(DType::BF16,
+                                    {records.spec.key_dim, records.spec.qk_heads, width, group});
+        records.value = work_.alloc(
+            DType::BF16, {records.spec.value_dim, records.spec.value_heads, width, group});
+        records.gate  = work_.alloc(DType::FP32, {2, records.spec.value_heads, width, group});
+        ScopedValue<GdnStateAction> action_binding(gdn_state_action_,
+                                                   GdnStateAction::RecordForReplay);
+        ScopedValue<const GdnReplayRecords*> records_binding(replay_records_, &records);
+        ScopedValue<bool> wide_binding(score_branch_wide_, true);
+
+        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
+        Tensor gathered =
+            work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+        ops::embedding(ids.view({columns}), *embed_, x, stream);
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        const std::size_t row_bytes = static_cast<std::size_t>(config_.hidden_size) * 2U;
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const std::int32_t column = last_columns[static_cast<std::size_t>(row)];
+            if (column < 0 || column >= width) {
+                throw std::invalid_argument("score branch last column is outside its row");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<std::byte*>(gathered.data) + row_bytes * row,
+                static_cast<const std::byte*>(x.data) + row_bytes * (row * width + column),
+                row_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+        Tensor hidden = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+        Tensor logits = work_.alloc(DType::BF16, {dimension(config_.vocab_size), batch});
+        ops::rmsnorm(gathered, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
+        project(hidden, *lm_head_, logits, work_, stream);
+        const std::int32_t stride = targets.ne[0];
+        for (std::int32_t c = 0; c < candidates; ++c) {
+            const Tensor ids_c = targets.slice(1, c, 1).view({stride}).slice(0, 0, batch);
+            Tensor out_c       = logprobs.slice(1, c, 1).view({stride}).slice(0, 0, batch);
+            ops::target_logprobs(logits, ids_c, vocabulary, out_c, stream);
+        }
+    }
+    work_.reset();
+}
+
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -901,14 +999,37 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                         active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, ctx_.execution_view());
+        if (!score_branch_wide_) {
+            ops::causal_softmax_attention(
+                q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                {dimension(config_.attention->head_dim),
+                 dimension(config_.attention->num_attention_heads),
+                 dimension(config_.attention->num_key_value_heads)},
+                static_cast<float>(
+                    1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_,
+                work_, a_batch, ctx_.execution_view());
+        } else {
+            // Score branches: the batched attention kernels take at most kScoreBranchGroup rows.
+            for (std::int32_t first = 0; first < active_sequence_batch_;
+                 first += kScoreBranchGroup) {
+                const std::int32_t rows =
+                    std::min(kScoreBranchGroup, active_sequence_batch_ - first);
+                auto scope   = work_.scope();
+                Tensor a_rows = a_batch.slice(3, first, rows);
+                ops::causal_softmax_attention(
+                    q_batch.slice(3, first, rows), k_batch.slice(3, first, rows),
+                    v_batch.slice(3, first, rows), position_batch.slice(1, first, rows),
+                    valid.slice(0, first, rows), kv_table_rows.slice(0, first, rows),
+                    {dimension(config_.attention->head_dim),
+                     dimension(config_.attention->num_attention_heads),
+                     dimension(config_.attention->num_key_value_heads)},
+                    static_cast<float>(
+                        1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                    batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_,
+                    work_, a_rows, ctx_.execution_view());
+            }
+        }
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -971,10 +1092,24 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
-                                  *active_linear_state_source_slots_, records.conv, query_output,
-                                  key_output, value_output, gate_output, work_, s);
+            if (score_branch_wide_) {
+                // One unfused projection over every branch column, then a convolution of each
+                // row from the shared source window; the fused record kernel takes eight rows.
+                Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
+                Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
+                gdn_projection(h, p, qkv, z_flat, work_, s);
+                const Tensor conv_state =
+                    state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+                ops::causal_conv1d_silu_branch_split(qkv, p.convolution, conv_state, width, qc,
+                                                     kc, vc, s);
+            } else {
+                GdnReplayRecordLayer records =
+                    replay_records_->layer(gidx, active_sequence_batch_);
+                gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+                                      *active_linear_state_source_slots_, records.conv,
+                                      query_output, key_output, value_output, gate_output, work_,
+                                      s);
+            }
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1023,7 +1158,25 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             o.view({dimension(config_.gdn->linear_value_head_dim),
                     dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
+        if (score_branch_wide_) {
+            // Groups of kScoreBranchGroup rows, each writing the same throwaway record rows.
+            const float scale = static_cast<float>(
+                1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+            for (std::int32_t first = 0; first < active_sequence_batch_;
+                 first += kScoreBranchGroup) {
+                const std::int32_t rows =
+                    std::min(kScoreBranchGroup, active_sequence_batch_ - first);
+                GdnReplayRecordLayer records = replay_records_->layer(0, rows);
+                Tensor out_rows              = out_batch.slice(3, first, rows);
+                ops::gated_delta_net_replay_record(
+                    q_batch.slice(3, first, rows), k_batch.slice(3, first, rows),
+                    v_batch.slice(3, first, rows), g_batch.slice(2, first, rows),
+                    beta_batch.slice(2, first, rows), scale, recurrent_states,
+                    valid.slice(0, first, rows),
+                    active_linear_state_source_slots_->slice(0, first, rows), records.key,
+                    records.value, records.gate, out_rows, s);
+            }
+        } else if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,

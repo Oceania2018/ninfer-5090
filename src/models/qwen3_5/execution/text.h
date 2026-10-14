@@ -31,6 +31,10 @@ enum class GdnStateAction : std::uint8_t {
     RecordForReplay,
 };
 
+// Rows per attention and GDN recurrence call in score_branch_batch: the batch domain of the
+// Verify kernels.
+inline constexpr std::int32_t kScoreBranchGroup = 8;
+
 struct NullTap {
     static constexpr bool enabled = false;
 };
@@ -145,6 +149,18 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+    // Verify-shaped forward of B independent branches of W columns. Every row continues from the
+    // Linear Attention state in the configured source slot, which is read and never written, and
+    // attends through its own KV table row. Projections run once over all W * B columns; the
+    // attention and GDN recurrence kernels run on groups of at most kScoreBranchGroup rows. Only
+    // column last_columns[b] of row b is projected to logits, and logprobs[b, c] receives the
+    // log-probability of targets[b, c] for c < candidates (both [>=B, >=candidates]).
+    void score_branch_batch(const Tensor& ids, const Tensor& cache_positions,
+                            const Tensor& rope_positions, const Tensor& valid_columns,
+                            const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                            ops::CausalAttentionExecutionEnvelope envelope,
+                            std::span<const std::int32_t> last_columns, const Tensor& targets,
+                            std::int32_t candidates, std::int32_t vocabulary, Tensor& logprobs);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -242,6 +258,8 @@ private:
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
+    // Set by score_branch_batch: wide Verify batches with throwaway single-layer records.
+    bool score_branch_wide_                   = false;
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;

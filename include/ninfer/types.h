@@ -184,6 +184,9 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    // Branches evaluated per score_branches pass (0 disables branch scoring, at most 256). Each
+    // row keeps a private KV table row and about one KV page; unset selects 100.
+    std::optional<std::uint32_t> score_branch_rows;
     StartupObserver startup_observer;
 };
 
@@ -260,11 +263,24 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+// Upper bound on ExecutionOptions::score_candidates; System One choice questions allow 255 options.
+inline constexpr std::size_t kMaximumScoreCandidates = 256;
+// Upper bounds on ExecutionOptions::score_branches: branch count and tokens per branch.
+inline constexpr std::size_t kMaximumScoreBranches     = 256;
+inline constexpr std::size_t kMaximumScoreBranchTokens = 5;
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // When non-empty, the result reports log p(token | prompt) at the prompt frontier for each id,
+    // normalized over the full vocabulary and taken from the raw (unconstrained) logits.
+    std::vector<TokenId> score_candidates;
+    // When non-empty (requires score_candidates), each branch is appended to the prompt on its
+    // own and the candidates are scored at the end of prompt + branch instead of at the prompt
+    // frontier. Branches share the prompt's computed state; none of them extends the request.
+    std::vector<std::vector<TokenId>> score_branches;
 };
 
 struct OutputOptions {
@@ -924,6 +940,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+    // One entry per ExecutionOptions::score_candidates id, in request order; empty otherwise.
+    // With score_branches, branch-major: entry [b * candidates + c].
+    std::vector<float> candidate_logprobs;
 };
 
 struct ArenaMemorySummary {

@@ -224,6 +224,16 @@ std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
 
 void Program::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
 
+std::vector<float> Program::score_tail(SequenceHandle h, std::span<const TokenId> candidates) {
+    return impl_->score_tail(h, candidates);
+}
+
+std::vector<float> Program::score_branches(SequenceHandle h,
+                                           std::span<const std::vector<TokenId>> branches,
+                                           std::span<const TokenId> candidates) {
+    return impl_->score_branches(h, branches, candidates);
+}
+
 bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
 
 ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,

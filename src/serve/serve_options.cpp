@@ -130,7 +130,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N] [--host-state-dtype fp32|bf16|nvfp4] "
-           "[--ctx-checkpoints N] "
+           "[--ctx-checkpoints N] [--score-branch-rows N] "
            "[--ctx-checkpoint-boundaries off|turns] [--ctx-checkpoint-skip-media-tail on|off] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -170,6 +170,8 @@ std::string serve_usage_text(const char* argv0) {
            "(default bf16; fp32 is exact, nvfp4 is the smallest); Device state stays fp32\n"
            "       --ctx-checkpoints keeps N superseded prefix points per request chain "
            "(default 4, 0 disables)\n"
+           "       --score-branch-rows sets branches per /v1/systemone rank pass (0 disables "
+           "rank, at most 256, default 100); each row keeps about one KV page\n"
            "       --ctx-checkpoint-boundaries turns checkpoints the first message, the first "
            "user turn and the last history turn of OpenAI requests that mark no boundary "
            "(agent loops; default); off keeps one automatic point at the end of the prompt\n"
@@ -279,6 +281,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--device-state-slots") {
             options.context_cache.device_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
+        } else if (arg == "--score-branch-rows") {
+            options.score_branch_rows = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--score-branch-rows"), "score-branch-rows"));
+            if (*options.score_branch_rows > ninfer::kMaximumScoreBranches) {
+                throw std::invalid_argument("--score-branch-rows must be in [0,256]");
+            }
         } else if (arg == "--ctx-checkpoints") {
             options.context_cache.ctx_checkpoints = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ctx-checkpoints"), "ctx-checkpoints"));

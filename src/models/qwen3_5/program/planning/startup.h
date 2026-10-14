@@ -20,6 +20,29 @@ namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
+// Branch scoring evaluates up to score_branch_rows branches per pass, each padded to the longest
+// branch of the request (at most kScoreBranchWidth columns). Projections run once over every column of the pass; the attention
+// and GDN recurrence kernels take execution::kScoreBranchGroup rows per call. Every row owns a
+// private KV table row and one private tail page, or two when the branch crosses a page boundary.
+inline constexpr std::uint32_t kDefaultScoreBranchRows = 100;
+inline constexpr std::int32_t kScoreBranchWidth = static_cast<std::int32_t>(kMaximumScoreBranchTokens);
+
+// Private tail pages for `rows` branch rows: one each, and enough for half of them to hold two.
+[[nodiscard]] constexpr std::uint32_t score_branch_pages(std::uint32_t rows) noexcept {
+    return rows == 0 ? 0U : (rows < 2U ? 2U : rows + rows % 2U);
+}
+
+// Per-pass I32 inputs: ids, cache positions and RoPE positions [W,B], then valid columns,
+// KV table rows and Linear Attention source slots [B].
+[[nodiscard]] constexpr std::int32_t score_branch_input_words(std::int32_t rows) noexcept {
+    return 3 * kScoreBranchWidth * rows + 3 * rows;
+}
+
+struct ScoreBranchLayout {
+    TensorLayout inputs;   // I32 [score_branch_input_words(score_branch_rows)]
+    TensorLayout targets;  // I32 [score_branch_rows, kMaximumScoreCandidates]
+    TensorLayout logprobs; // FP32 [score_branch_rows, kMaximumScoreCandidates]
+};
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -43,6 +66,7 @@ struct PersistentLayout {
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::optional<TensorLayout> grammar_masks;
+    std::optional<ScoreBranchLayout> score_branches;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -65,6 +89,7 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    std::size_t score_branches   = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
@@ -85,6 +110,7 @@ struct SequencePlanningInputs {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    std::uint32_t score_branch_rows   = 0;
 };
 
 struct SequencePlanImpl {
@@ -104,6 +130,7 @@ struct SequencePlanImpl {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    std::uint32_t score_branch_rows = 0;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

@@ -472,6 +472,19 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    failures += check(!defaults.score_branch_rows.has_value(),
+                      "score branch rows are set without --score-branch-rows");
+    const ServeOptions rows = parse({"ninfer-serve", "model.ninfer", "--score-branch-rows", "24"});
+    failures += check(rows.score_branch_rows == 24U, "--score-branch-rows 24 is not parsed");
+    const ServeOptions no_rank =
+        parse({"ninfer-serve", "model.ninfer", "--score-branch-rows", "0"});
+    failures += check(no_rank.score_branch_rows == 0U, "--score-branch-rows 0 is not accepted");
+    bool oversized_rows_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--score-branch-rows", "257"});
+    } catch (const std::invalid_argument&) { oversized_rows_rejected = true; }
+    failures += check(oversized_rows_rejected, "--score-branch-rows above 256 is accepted");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

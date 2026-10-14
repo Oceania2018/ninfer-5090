@@ -187,6 +187,44 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
     throw std::logic_error("causal_conv1d: unhandled split geometry");
 }
 
+template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
+void branch_split_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                         std::int32_t width, Tensor& out0, Tensor& out1, Tensor& out2,
+                         cudaStream_t stream) {
+    const std::int32_t C    = x.ne[0];
+    const std::int32_t rows = x.ne[1] / width;
+    if (Rows0 + Rows1 + Rows2 != C) {
+        throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
+    }
+    const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(width));
+    const dim3 grid(static_cast<unsigned int>(grid_for(C, kCausalConvChannelTile, "branch")),
+                    static_cast<unsigned int>(rows));
+    const CausalConvSplitOutput3<__nv_bfloat16, Rows0, Rows1, Rows2> out_map{
+        static_cast<__nv_bfloat16*>(out0.data), static_cast<__nv_bfloat16*>(out1.data),
+        static_cast<__nv_bfloat16*>(out2.data)};
+    causal_conv1d_branch_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        static_cast<const __nv_bfloat16*>(conv_state.data), out_map, C, width);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void causal_conv1d_branch_split_launch(const Tensor& x, const Tensor& weight,
+                                       const Tensor& conv_state, std::int32_t width, Tensor& out0,
+                                       Tensor& out1, Tensor& out2, CausalConvSplitGeometry geometry,
+                                       cudaStream_t stream) {
+    switch (geometry) {
+    case CausalConvSplitGeometry::Rows2048x2048x4096:
+        branch_split_launch<2048, 2048, 4096>(x, weight, conv_state, width, out0, out1, out2,
+                                              stream);
+        return;
+    case CausalConvSplitGeometry::Rows2048x2048x6144:
+        branch_split_launch<2048, 2048, 6144>(x, weight, conv_state, width, out0, out1, out2,
+                                              stream);
+        return;
+    }
+    throw std::logic_error("causal_conv1d: unhandled split geometry");
+}
+
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 256;

@@ -14,6 +14,8 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    std::vector<TokenId> score_candidates;
+    std::vector<std::vector<TokenId>> score_branches;
 };
 
 struct ResolvedRequestOptions {
