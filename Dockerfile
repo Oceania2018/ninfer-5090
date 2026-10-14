@@ -18,12 +18,16 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
+# Heavy nvcc translation units take 1-2 GB each; an unbounded --parallel on a many-core,
+# modest-RAM host OOMs the build. Override with --build-arg BUILD_JOBS=N.
+ARG BUILD_JOBS=8
+
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve
+    && cmake --build /build --parallel ${BUILD_JOBS} --target ninfer ninfer-serve
 
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
