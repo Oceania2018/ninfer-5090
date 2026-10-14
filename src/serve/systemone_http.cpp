@@ -4,6 +4,7 @@
 #include "serve/openai_common.h"
 #include "serve/systemone.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -33,6 +34,7 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
     };
     RequestJson answers             = RequestJson::object();
     std::uint64_t input_tokens      = 0;
+    std::uint64_t cached_tokens     = 0;
     std::uint64_t output_tokens     = 0;
     for (const SystemOneQuestion& question : request.questions) {
         const std::uint64_t req_id = ++request_seq_;
@@ -88,13 +90,18 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
             return;
         }
         input_tokens += static_cast<std::uint64_t>(outcome.prompt_tokens);
+        cached_tokens += std::min<std::uint64_t>(outcome.metrics.prefix_cache_hit_tokens,
+                                                 static_cast<std::uint64_t>(outcome.prompt_tokens));
         output_tokens += systemone_output_tokens(question);
     }
 
     RequestJson payload = RequestJson::object();
     payload["model"]    = request.model;
     payload["answers"]  = std::move(answers);
-    payload["usage"]    = {{"input_tokens", input_tokens}, {"output_tokens", output_tokens}};
+    // cached_input_tokens is the part of input_tokens served from the prefix cache.
+    payload["usage"]    = {{"input_tokens", input_tokens},
+                           {"cached_input_tokens", cached_tokens},
+                           {"output_tokens", output_tokens}};
     res.set_content(payload.dump(), "application/json");
 }
 
