@@ -55,13 +55,28 @@ void iq3_xxs_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& ou
     const auto* d     = static_cast<const __half*>(w.scales);
     const Iq3XxsSwiGluOut o{static_cast<__nv_bfloat16*>(out.data), kHalfRows};
     const int tokens = x.ne[1];
+#if defined(NINFER_SM86)
+    // sm_89 (RTX 4090, 128 SMs): one warp per CTA leaves too few loads in flight to saturate
+    // ~1 TB/s; split K across warps over 16-row tiles instead. Measured on the 4090, weights
+    // streamed from DRAM: T=1 142.8 -> 81.0 us (478 -> 843 GB/s), T=16 157.1 -> 96.6 us,
+    // T=32 187.8 -> 129.9 us.
+    if (tokens <= 8) {
+        launch_direct<4, 1, 1>(xp, codes, d, tokens, o, stream);
+    } else if (tokens <= 16) {
+        launch_direct<4, 1, 2>(xp, codes, d, tokens, o, stream);
+    } else if (tokens <= 32) {
+        launch_direct<2, 1, 4>(xp, codes, d, tokens, o, stream);
+    }
+#else
     if (tokens <= 8) {
         launch_direct<1, 2, 1>(xp, codes, d, tokens, o, stream);
     } else if (tokens <= 16) {
         launch_direct<1, 2, 2>(xp, codes, d, tokens, o, stream);
     } else if (tokens <= 32) {
         launch_direct<1, 2, 4>(xp, codes, d, tokens, o, stream);
-    } else if (!int8_activations) {
+    }
+#endif
+    else if (!int8_activations) {
         launch_staged<4, 2, 8, 2>(xp, codes, d, tokens, o, stream);
     } else {
         auto scope     = ws.scope();
