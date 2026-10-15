@@ -231,6 +231,47 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
+// Branch form of the small-T kernel: blockIdx.y selects one of B rows of W columns, all of which
+// start from the same history window. Nothing is written back to the state.
+template <class Output>
+__global__ void causal_conv1d_branch_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                            const __nv_bfloat16* conv_state, Output out,
+                                            std::int32_t C, std::int32_t W) {
+    __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
+    __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
+
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x);
+    const std::int32_t t    = static_cast<std::int32_t>(threadIdx.y);
+    const std::int32_t row  = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t c64  = static_cast<std::int64_t>(blockIdx.x) * kCausalConvChannelTile + lane;
+    const std::int64_t C64  = static_cast<std::int64_t>(C);
+    const bool valid        = c64 < C64;
+
+    if (t == 0) {
+        for (std::int32_t s = 0; s < 3; ++s) {
+            history[s][lane] = valid ? conv_state[static_cast<std::int64_t>(s) * C64 + c64]
+                                     : __float2bfloat16(0.0f);
+        }
+        for (std::int32_t r = 0; r < 4; ++r) {
+            weights[r][lane] =
+                valid ? weight[static_cast<std::int64_t>(r) * C64 + c64] : __float2bfloat16(0.0f);
+        }
+    }
+    __syncthreads();
+    if (!valid) { return; }
+
+    const std::int64_t first = static_cast<std::int64_t>(row) * W;
+    const auto at            = [&](std::int32_t p) {
+        return p < 0 ? history[p + 3][lane] : x[(first + p) * C64 + c64];
+    };
+    float acc = 0.0f;
+    acc += __bfloat162float(weights[0][lane]) * __bfloat162float(at(t - 3));
+    acc += __bfloat162float(weights[1][lane]) * __bfloat162float(at(t - 2));
+    acc += __bfloat162float(weights[2][lane]) * __bfloat162float(at(t - 1));
+    acc += __bfloat162float(weights[3][lane]) * __bfloat162float(at(t));
+    *out.column(c64).at(static_cast<std::int32_t>(first) + t) = __float2bfloat16_rn(silu(acc));
+}
+
 __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                             __nv_bfloat16* conv_state, __nv_bfloat16* out,
                                             std::int32_t C) {

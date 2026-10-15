@@ -777,6 +777,9 @@ private:
         result.tool_call_parse                 = request->output.tool_call_parse_diagnostics();
         result.reasoning_tokens                = request->output.reasoning_tokens();
         result.finish_reason                   = reason;
+        if (request->candidate_logprobs) {
+            result.candidate_logprobs = std::move(*request->candidate_logprobs);
+        }
         result.matched_stop_string             = request->output.matched_stop_string();
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
@@ -1347,6 +1350,17 @@ private:
         }
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
+        if (!request->options.execution.score_candidates.empty() &&
+            !request->candidate_logprobs) {
+            // The target tail hidden still holds the prompt frontier until the Begin token commits.
+            const auto& execution = request->options.execution;
+            request->candidate_logprobs =
+                execution.score_branches.empty()
+                    ? instance_.program->score_tail(*request->sequence, execution.score_candidates)
+                    : instance_.program->score_branches(*request->sequence,
+                                                        execution.score_branches,
+                                                        execution.score_candidates);
+        }
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);

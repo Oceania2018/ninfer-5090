@@ -318,6 +318,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
+    engine_options.score_branch_rows        = options_.score_branch_rows;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
@@ -377,6 +378,39 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
+    for (const std::string& candidate : request.score_candidates) {
+        const std::vector<ninfer::TokenId> ids = engine_->tokenize_text(candidate);
+        if (ids.size() != 1) {
+            throw ApiException(ApiError{
+                .status  = 400,
+                .message = "score candidate \"" + candidate + "\" encodes to " +
+                           std::to_string(ids.size()) + " tokens; exactly one is required",
+                .param   = "ninfer_score_candidates",
+                .code    = "candidate_not_single_token"});
+        }
+        request_options.execution.score_candidates.push_back(ids.front());
+    }
+    if (!request.score_branches.empty() && options_.score_branch_rows == 0U) {
+        throw ApiException(ApiError{.status  = 400,
+                                    .message = "branch scoring is disabled on this server "
+                                               "(--score-branch-rows 0)",
+                                    .param   = "ninfer_score_branches",
+                                    .code    = "branch_scoring_disabled"});
+    }
+    for (const std::string& branch : request.score_branches) {
+        std::vector<ninfer::TokenId> ids = engine_->tokenize_text(branch);
+        if (ids.empty() || ids.size() > ninfer::kMaximumScoreBranchTokens) {
+            throw ApiException(ApiError{
+                .status  = 400,
+                .message = "score branch \"" + branch + "\" encodes to " +
+                           std::to_string(ids.size()) + " tokens; 1 to " +
+                           std::to_string(ninfer::kMaximumScoreBranchTokens) + " are allowed",
+                .param   = "ninfer_score_branches",
+                .code    = "branch_too_long"});
+        }
+        request_options.execution.score_branches.push_back(std::move(ids));
+    }
+    prepared.score_branch_count  = request.score_branches.size();
     prepared.thinking_budget     = request_options.execution.thinking.budget;
     prepared.reasoning_effort    = semantics.reasoning_effort;
     prepared.preserve_thinking   = semantics.preserve_thinking;
@@ -511,6 +545,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.constraint          = result.constraint;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
+    outcome.candidate_logprobs  = std::move(result.candidate_logprobs);
+    outcome.score_branch_count  = prepared.score_branch_count;
 
     outcome.metrics.prepare_seconds =
         prepared.service_prepare_seconds + result.timings.prepare_seconds;

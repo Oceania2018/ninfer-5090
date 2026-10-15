@@ -62,6 +62,10 @@ struct GenerationOutcome {
     std::optional<ninfer::ConstraintObservation> constraint;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
+    // ninfer_score_candidates order; with ninfer_score_branches, branch-major
+    // [branch * candidates + candidate]. Empty when not requested.
+    std::vector<float> candidate_logprobs;
+    std::size_t score_branch_count = 0;
     GenerationMetrics metrics;
 };
 
@@ -105,6 +109,7 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    std::size_t score_branch_count = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;

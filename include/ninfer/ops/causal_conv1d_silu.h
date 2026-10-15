@@ -40,6 +40,13 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                               cudaStream_t stream);
 
+// Branch form of the split op. The C x (width * B) columns of x hold B independent rows of
+// `width` columns; every row continues from the same read-only conv_state window [C,3], which
+// is never written. Destinations follow the split row profiles above. width is 1..32.
+void causal_conv1d_silu_branch_split(const Tensor& x, const Tensor& weight,
+                                     const Tensor& conv_state, std::int32_t width, Tensor& out0,
+                                     Tensor& out1, Tensor& out2, cudaStream_t stream);
+
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and

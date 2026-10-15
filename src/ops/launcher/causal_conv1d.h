@@ -32,6 +32,10 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
                                        CausalConvSplitGeometry geometry, cudaStream_t stream);
+void causal_conv1d_branch_split_launch(const Tensor& x, const Tensor& weight,
+                                       const Tensor& conv_state, std::int32_t width, Tensor& out0,
+                                       Tensor& out1, Tensor& out2, CausalConvSplitGeometry geometry,
+                                       cudaStream_t stream);
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -42,6 +43,8 @@ enum class GdnWorkspacePath : std::uint8_t {
     Prefill,
     Snapshot,
     ReplayRecord,
+    // Unfused projection and convolution over every branch column (score_branch_batch).
+    ScoreBranch,
 };
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
@@ -132,8 +135,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
-                     .text_physical_page_groups = physical_pages,
+                     .kv_table_rows             = static_cast<std::int32_t>(
+                         plan.max_concurrency + plan.score_branch_rows),
+                     // Branch-scoring scratch pages are leased at startup, so they are planned
+                     // in addition to the admitted Main KV page groups.
+                     .text_physical_page_groups =
+                         physical_pages +
+                         score_branch_pages(plan.score_branch_rows),
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
     qwen3_5::StateImageSpec state_image_spec{
@@ -267,6 +275,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+    }
+    if (plan.score_branch_rows != 0 && config.gdn) {
+        const auto rows          = static_cast<std::int32_t>(plan.score_branch_rows);
+        const auto candidates    = static_cast<std::int32_t>(kMaximumScoreCandidates);
+        ScoreBranchLayout& score = out.score_branches.emplace();
+        score.inputs   = add_tensor(builder, DType::I32, {score_branch_input_words(rows)},
+                                    "score inputs");
+        score.targets  = add_tensor(builder, DType::I32, {rows, candidates}, "score candidate ids");
+        score.logprobs = add_tensor(builder, DType::FP32, {rows, candidates},
+                                    "score candidate logprobs");
     }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
@@ -722,9 +740,42 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (plan.score_branch_rows != 0 && config.gdn) {
+        // Mirrors TextContext::score_branch_batch: throwaway records for one group of rows, the
+        // pass columns and gathered last columns, the layers, then the projected last columns.
+        const auto rows              = static_cast<std::int32_t>(plan.score_branch_rows);
+        const auto group             = std::min(rows, execution::kScoreBranchGroup);
+        const std::int32_t aggregate = kScoreBranchWidth * rows;
+        const std::int32_t recorded  = kScoreBranchWidth * group;
+        const auto& gdn_config       = *config.gdn;
+        WorkspaceLayoutBuilder score;
+        matrix(score, DType::BF16, dimension(gdn_config.conv_channels()), recorded);
+        matrix(score, DType::BF16,
+               dimension(gdn_config.linear_key_head_dim) *
+                   dimension(gdn_config.linear_num_key_heads),
+               recorded);
+        matrix(score, DType::BF16,
+               dimension(gdn_config.linear_value_head_dim) *
+                   dimension(gdn_config.linear_num_value_heads),
+               recorded);
+        matrix(score, DType::FP32, 2 * dimension(gdn_config.linear_num_value_heads), recorded);
+        matrix(score, DType::BF16, dimension(config.hidden_size), aggregate);
+        matrix(score, DType::BF16, dimension(config.hidden_size), rows);
+        {
+            auto layers = score.scope();
+            target_body(score, aggregate, aggregate, qwen3_5::TextPhase::Verify,
+                        GdnWorkspacePath::ScoreBranch, group, kScoreBranchWidth,
+                        kScoreBranchWidth, text_envelope);
+        }
+        matrix(score, DType::BF16, dimension(config.hidden_size), rows);
+        matrix(score, DType::BF16, dimension(config.vocab_size), rows);
+        linear_scratch(score, parameters.text.output_head, 1, rows);
+        out.score_branches = finish(score);
+    }
+
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.causal_score, out.score_branches});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
@@ -853,6 +904,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->score_branch_rows           = inputs.score_branch_rows;
     impl->persistent           = persistent_layout(*impl);
     if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
@@ -933,6 +985,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };
+    if (!inputs.causal_scoring && parameters.model.config().text.gdn) {
+        inputs.score_branch_rows = options.score_branch_rows.value_or(kDefaultScoreBranchRows);
+        if (inputs.score_branch_rows > kMaximumScoreBranches) {
+            throw std::invalid_argument("score branch rows must be in [0,256]");
+        }
+    }
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =

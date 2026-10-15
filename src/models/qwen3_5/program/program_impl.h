@@ -301,6 +301,10 @@ public:
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
     void skip_capture(SequenceHandle);
+    [[nodiscard]] std::vector<float> score_tail(SequenceHandle, std::span<const TokenId>);
+    [[nodiscard]] std::vector<float> score_branches(SequenceHandle,
+                                                    std::span<const std::vector<TokenId>>,
+                                                    std::span<const TokenId>);
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   runtime::ContextResourceUsage) const;
@@ -373,6 +377,18 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // score_branches: pass I/O plus KV table rows and tail pages leased for the whole Program
+    // lifetime. Declared after decoder so its leases release first.
+    struct ScoreBranchScratch {
+        std::int32_t row_count = 0;
+        Tensor inputs;
+        Tensor targets;
+        Tensor logprobs;
+        std::vector<KVExecutionRowLease> rows;
+        std::vector<DeviceKVPageLease> pages;
+        PinnedHostBuffer host;
+    };
+    std::optional<ScoreBranchScratch> score_scratch;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
