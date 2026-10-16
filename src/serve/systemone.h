@@ -6,7 +6,9 @@
 // NInfer extension "rank" grades up to 256 keyed candidates against the shared state in a single
 // request (one prefill plus one short branch per candidate) on an ordered similarity scale, and
 // returns every candidate's expected similarity in [0, 1], sorted, with the ones at or above a
-// threshold listed as the ranking.
+// threshold listed as the ranking. As in the spec (docs.ollama.com/api/systemone), "images" are
+// base64 strings shared by every question, answers carry their "type", and errors are
+// {"error": "<message>"}. Extensions: "rank", "system", and usage.cached_input_tokens.
 
 #include "serve/request.h"
 #include "serve/request_json.h"

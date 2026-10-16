@@ -1,3 +1,4 @@
+#include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/systemone.h"
 
@@ -108,10 +109,68 @@ int main() {
     bad_scale["questions"]["similar"]["scale"] = {"only one level"};
     failures += check(!rejection(bad_scale).empty(), "rank accepts a one-level scale");
 
+    // Images are base64, shared by every question and placed before the text of the user turn.
     RequestJson with_images = rank_body({{"x", "only"}});
-    with_images["images"] = {"aGVsbG8="};
-    failures += check(rejection(with_images) == "unsupported_images",
-                      "systemone accepts images it cannot use");
+    with_images["images"]   = {"iVBORw0KGgoAAAA=", "/9j/4AAQ"};
+    with_images["questions"]["done"] = {{"type", "noul"}, {"instructions", "Is the task done?"}};
+    const SystemOneRequest imaged    = parse_systemone_request(with_images);
+    for (const SystemOneQuestion& question : imaged.questions) {
+        const auto& content = question.generation.messages.at(1).content;
+        failures += check(content.size() == 3 && content[0].kind == ContentKind::Image &&
+                              content[1].kind == ContentKind::Image &&
+                              content[2].kind == ContentKind::Text,
+                          "images are not placed before the question text");
+        failures += check(content[0].source.value == "data:image/png;base64,iVBORw0KGgoAAAA=" &&
+                              content[1].source.media_type == "image/jpeg",
+                          "image data is not carried as a base64 data source");
+    }
+    for (const char* source : {"data:image/png;base64,iVBORw0KGgo=", "https://x/a.png", ""}) {
+        RequestJson bad_image = rank_body({{"x", "only"}});
+        bad_image["images"]   = {source};
+        failures += check(!rejection(bad_image).empty(), "systemone accepts a non-base64 image");
+    }
+    RequestJson object_images = rank_body({{"x", "only"}});
+    object_images["images"]   = {{"data", "aGVsbG8="}};
+    failures += check(!rejection(object_images).empty(), "systemone accepts a non-array images");
+
+    // Instructions may be any nonempty JSON value; keep_alive is accepted and ignored.
+    RequestJson json_instructions = rank_body({{"x", "only"}});
+    json_instructions["questions"]["similar"]["instructions"] = {{"goal", "rate similarity"}};
+    json_instructions["keep_alive"]                         = "5m";
+    failures += check(rejection(json_instructions).empty(),
+                      "systemone rejects JSON instructions or keep_alive");
+    RequestJson empty_instructions = rank_body({{"x", "only"}});
+    empty_instructions["questions"]["similar"]["instructions"] = RequestJson::object();
+    failures += check(!rejection(empty_instructions).empty(),
+                      "systemone accepts empty instructions");
+    RequestJson bad_keep_alive = rank_body({{"x", "only"}});
+    bad_keep_alive["keep_alive"] = RequestJson::array();
+    failures += check(!rejection(bad_keep_alive).empty(), "systemone accepts an array keep_alive");
+
+    // Every answer names its type, as the spec's answer objects do.
+    {
+        RequestJson typed = rank_body({{"x", "only"}});
+        typed["questions"]["pick"] = {{"type", "choice"},
+                                      {"instructions", "Which one?"},
+                                      {"criteria", {{"a", nullptr}, {"b", "second"}}}};
+        typed["questions"]["done"] = {{"type", "noul"}, {"instructions", "Done?"}};
+        typed["questions"]["level"] = {
+            {"type", "score"}, {"instructions", "How bad?"}, {"criteria", {"low", "high"}}};
+        for (const SystemOneQuestion& question : parse_systemone_request(typed).questions) {
+            GenerationOutcome outcome;
+            const std::size_t values = question.kind == SystemOneKind::Rank
+                                           ? question.keys.size() * question.legend.size()
+                                           : question.generation.score_candidates.size();
+            outcome.candidate_logprobs.assign(values, -1.0F);
+            const RequestJson answer = make_systemone_answer(question, outcome);
+            const char* expected     = question.name == "similar" ? "rank"
+                                       : question.name == "pick"  ? "choice"
+                                       : question.name == "done"  ? "noul"
+                                                                  : "score";
+            failures += check(answer.value("type", "") == expected, "answer type is missing");
+        }
+    }
+
     RequestJson empty_images = rank_body({{"x", "only"}});
     empty_images["images"] = RequestJson::array();
     failures += check(rejection(empty_images).empty(), "systemone rejects an empty images list");

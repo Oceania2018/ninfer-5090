@@ -1063,6 +1063,7 @@ private:
                                    static_cast<std::ptrdiff_t>(row * pending.row_stride());
                 request->generated.insert(request->generated.end(), first,
                                           first + static_cast<std::ptrdiff_t>(accepted));
+                round_diag(*request, decode_round, std::span<const TokenId>(&*first, accepted));
             }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -1226,6 +1227,25 @@ private:
             return;
         }
         context_owner_ = request;
+    }
+
+    // Committed-token trace on stderr, one line per commit, enabled with NINFER_ROUND_DIAG=1:
+    // "[round-diag] req=<id> decode=<0|1> n=<count> ids=<a,b,...>". Used to see how many tokens
+    // each speculative verify round lands, and which of them a grammar fixed.
+    void round_diag(const Request& request, bool decode_round, std::span<const TokenId> tokens) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_ROUND_DIAG");
+            return value && *value == '1';
+        }();
+        if (!enabled) { return; }
+        std::string ids;
+        for (const TokenId token : tokens) {
+            if (!ids.empty()) { ids += ','; }
+            ids += std::to_string(token);
+        }
+        std::fprintf(stderr, "[round-diag] req=%llu decode=%d n=%zu ids=%s\n",
+                     static_cast<unsigned long long>(request.id), decode_round ? 1 : 0,
+                     tokens.size(), ids.c_str());
     }
 
     // Capture-admission trace on stderr, enabled with NINFER_CACHE_DIAG=1.
