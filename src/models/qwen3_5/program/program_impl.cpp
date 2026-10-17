@@ -157,6 +157,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
+    // The disk tier copies Host replicas of cross-request history.
+    if (plan.context_cache.disk_capacity_bytes != 0) {
+        if (host_bytes == 0 || !plan.context_cache.enabled) {
+            throw std::invalid_argument(
+                "the disk context tier requires prefix reuse and a nonzero Host context budget");
+        }
+        disk_store = std::make_unique<DiskContextStore>(plan.context_cache.disk_directory,
+                                                        plan.context_cache.disk_capacity_bytes);
+        disk_io     = std::make_unique<HostWorkerPool>(1, 1);
+        disk_reader = std::make_unique<HostWorkerPool>(1, 1);
+    }
     const auto logical_pages = [&](const DeviceKVPagePool& pool) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
         return checked_count(pool.capacity_pages() + host_bytes / stride);
@@ -264,6 +275,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    abort_disk_restore();
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }

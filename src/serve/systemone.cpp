@@ -61,6 +61,64 @@ std::optional<std::string> optional_text(const RequestJson& object, const char* 
     return require_text(object.at(key), param);
 }
 
+const char* systemone_type_name(SystemOneKind kind) {
+    switch (kind) {
+    case SystemOneKind::Choice: return "choice";
+    case SystemOneKind::Noul: return "noul";
+    case SystemOneKind::Score: return "score";
+    case SystemOneKind::Rank: return "rank";
+    }
+    return "choice";
+}
+
+// Spec: "a nonempty string or JSON value"; a JSON value is shown to the model as indented JSON.
+std::string render_instructions(const RequestJson& value, const std::string& param) {
+    if (value.is_string()) { return require_text(value, param); }
+    if (value.is_null() || ((value.is_object() || value.is_array()) && value.empty())) {
+        bad_request(param + " must be a nonempty string or JSON value", param);
+    }
+    return value.dump(2);
+}
+
+// Media type from the leading base64 characters, for logs only: decoding probes the bytes.
+std::string_view sniff_image_type(std::string_view base64) {
+    if (base64.starts_with("iVBORw0KGgo")) { return "image/png"; }
+    if (base64.starts_with("/9j/")) { return "image/jpeg"; }
+    if (base64.starts_with("UklGR")) { return "image/webp"; }
+    if (base64.starts_with("R0lGOD")) { return "image/gif"; }
+    if (base64.starts_with("Qk")) { return "image/bmp"; }
+    return "application/octet-stream";
+}
+
+// Spec: base64-encoded images shared by every question, in request order; URLs and data URLs are
+// not accepted. Decoding, size and vision checks happen with the rest of the request's media.
+std::vector<ContentPart> parse_images(const RequestJson& body) {
+    std::vector<ContentPart> parts;
+    if (!body.contains("images") || body.at("images").is_null()) { return parts; }
+    const RequestJson& images = body.at("images");
+    if (!images.is_array()) {
+        bad_request("images must be an array of base64-encoded images", "images");
+    }
+    for (std::size_t i = 0; i < images.size(); ++i) {
+        const std::string param = "images[" + std::to_string(i) + "]";
+        const std::string data  = require_text(images.at(i), param);
+        if (data.starts_with("data:") || data.starts_with("http://") ||
+            data.starts_with("https://")) {
+            bad_request(param + " must be base64-encoded image data; URLs and data URLs are "
+                                "not supported",
+                        param);
+        }
+        ContentPart part;
+        part.kind              = ContentKind::Image;
+        part.type_raw          = "image";
+        part.source.kind       = ninfer::product::media_acquire::SourceKind::Data;
+        part.source.media_type = std::string(sniff_image_type(data));
+        part.source.value      = "data:" + part.source.media_type + ";base64," + data;
+        parts.push_back(std::move(part));
+    }
+    return parts;
+}
+
 std::string render_state(const RequestJson& body) {
     if (!body.contains("state")) { bad_request("missing required field: state", "state"); }
     const RequestJson& state = body.at("state");
@@ -292,10 +350,11 @@ SystemOneRequest parse_systemone_request(const RequestJson& body) {
     SystemOneRequest out;
     if (!body.contains("model")) { bad_request("missing required field: model", "model"); }
     out.model = require_text(body.at("model"), "model");
-    if (body.contains("images") && !body.at("images").is_null() &&
-        !(body.at("images").is_array() && body.at("images").empty())) {
-        bad_request("images are not supported by /v1/systemone on this server yet", "images",
-                    "unsupported_images");
+    const std::vector<ContentPart> images = parse_images(body);
+    // Accepted for compatibility; the model stays loaded for the life of the server.
+    if (body.contains("keep_alive") && !body.at("keep_alive").is_null() &&
+        !body.at("keep_alive").is_string() && !body.at("keep_alive").is_number()) {
+        bad_request("keep_alive must be a duration string or a number of seconds", "keep_alive");
     }
     const std::string state  = render_state(body);
     const std::string system = optional_text(body, "system", "system")
@@ -314,7 +373,8 @@ SystemOneRequest parse_systemone_request(const RequestJson& body) {
         if (!item.contains("instructions")) {
             bad_request(param + ".instructions is required", param + ".instructions");
         }
-        const std::string instructions = require_text(item.at("instructions"), param + ".instructions");
+        const std::string instructions =
+            render_instructions(item.at("instructions"), param + ".instructions");
         SystemOneQuestion question;
         question.name = it.key();
         if (type == "choice") {
@@ -332,6 +392,11 @@ SystemOneRequest parse_systemone_request(const RequestJson& body) {
         } else {
             bad_request(param + ".type must be choice, noul, score or rank", param + ".type");
         }
+        // Images come before the text in the user turn, as in an ordinary vision prompt.
+        if (!images.empty()) {
+            std::vector<ContentPart>& content = question.generation.messages.at(1).content;
+            content.insert(content.begin(), images.begin(), images.end());
+        }
         out.questions.push_back(std::move(question));
     }
     return out;
@@ -341,6 +406,7 @@ RequestJson make_systemone_answer(const SystemOneQuestion& question,
                                   const GenerationOutcome& outcome) {
     const std::vector<float>& logprobs = outcome.candidate_logprobs;
     RequestJson answer                 = RequestJson::object();
+    answer["type"]                     = systemone_type_name(question.kind);
     switch (question.kind) {
     case SystemOneKind::Choice: {
         const std::vector<double> p = normalized(logprobs);

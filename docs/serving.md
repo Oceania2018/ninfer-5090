@@ -908,6 +908,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
 | `--host-state-dtype fp32\|bf16\|nvfp4` | Host StateImage encoding of the GDN recurrent state, applied on Device-to-Host backup and inverted on restore; Device state stays FP32. `fp32` is exact; `bf16` rounds once per backup; `nvfp4` stores E2M1 codes with an E4M3 scale per 16 values and an FP32 scale per value head. Qwen3.8-27B + DFlash2 Host StateImage: 187 / 115 / 63 MiB | `bf16` |
+| `--disk-context-mib N` | NVMe tier below Host: cold Host-resident checkpoints are copied to disk in the background, and a request whose deepest match is only on disk rebuilds it into Host when that beats every resident source ([Disk tier](maintainer/resource-scheduling-and-context-cache.md#disk-tier)). `0` disables the tier | `0` (off) |
+| `--disk-context-dir DIR` | directory of the tier's unnamed, preallocated file; requires `--disk-context-mib`. Use a local ext4/xfs NVMe path, not a network or Windows-mounted drive | `$XDG_CACHE_HOME/ninfer/disk-context`, else `$HOME/.cache/ninfer/disk-context` |
 | `--ctx-checkpoints N` | superseded prefix points kept per request chain before older ones are retired; `0` disables chain bounding ([CUA context checkpoints](maintainer/cua-context-checkpoints.md)) | `4` |
 | `--ctx-checkpoint-boundaries off\|turns` | where OpenAI requests that mark no `prompt_cache_breakpoint` get checkpoints: `off` keeps the protocol's single automatic point at the end of the prompt; `turns` (agent loops) places them at the end of the first message, the first user turn and the last history turn before the final one, and drops the automatic point once a history point is placed ([CUA context checkpoints](maintainer/cua-context-checkpoints.md#boundaries)) | `turns` |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -941,6 +943,9 @@ Host state and Main/Backend KV share one startup-fixed byte budget; this is cont
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
+The disk tier needs prefix reuse and a nonzero Host budget; startup fails otherwise, and also when
+the directory cannot hold `--disk-context-mib`. Its file is unnamed (`O_TMPFILE`), so it never
+survives the process and two processes can share one directory.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
@@ -977,6 +982,9 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
+| `ninfer_disk_context_{capacity,used}_bytes`, `ninfer_disk_context_records` | Disk tier occupancy; capacity is 0 when the tier is off |
+| `ninfer_disk_context_{writes,write_bytes,writes_discarded,restores,restore_bytes,evictions,io_errors}_total` | Write-behind copies (discarded when a copied Host replica changed or I/O failed), rebuilds into Host, LRU evictions and I/O failures |
+| `ninfer_disk_context_restores_declined_{resident,busy,cost,host}_total` | Admission evaluations whose deepest disk match was not restored: a resident source was as deep, another restore was in flight, recomputing was cheaper, or Host room could not be made |
 | `ninfer_captures_skipped_total` | Optional checkpoint captures dropped because no admissible space could be reclaimed |
 | `ninfer_ctx_checkpoint_retired_{public,private}_total`, `ninfer_ctx_checkpoint_boosted_capture_admissions_total` | Request-chain bounding (`--ctx-checkpoints`): retired superseded or dead chain points, and capture admissions that inherited the extended point's demand |
 | `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |

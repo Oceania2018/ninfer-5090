@@ -98,6 +98,75 @@ public:
 
     [[nodiscard]] const LineageStats& lineage_stats() const { return lineage_stats_; }
 
+    // Disk tier write-behind candidates, in the order reclaim would delete them (so what Host loses
+    // first is the most likely to be on disk already), restricted to points a later request can
+    // still resume from:
+    // - a public point that no deeper point of its chain superseded, and that is either a chain
+    //   head or was ever adopted. A superseded point only backs a retry of a step the chain moved
+    //   past; an unadopted point outside any chain is a one-off request's own marker.
+    // - a private point whose owner was ever adopted, such as a continuing conversation. Other
+    //   private points serve only the request that made them.
+    // Demand is "ever", not the current reuse tier: balance_reused demotes the oldest demand out
+    // of that tier, and those are exactly the points Host is about to lose.
+    [[nodiscard]] std::vector<Handle> disk_write_candidates() const {
+        std::vector<Handle> out;
+        for (const auto handle : victims()) {
+            const bool shared = std::any_of(shared_.begin(), shared_.end(), [&](const auto& entry) {
+                return entry.handle == handle && !entry.superseded &&
+                       (entry.priority.last_demand != 0 || entry.lineage != 0);
+            });
+            const bool owned = std::any_of(owners_.begin(), owners_.end(), [&](const auto& owner) {
+                return owner.priority.last_demand != 0 &&
+                       std::any_of(owner.points.begin(), owner.points.end(),
+                                   [&](const auto& point) { return point.handle == handle; });
+            });
+            if (shared || owned) { out.push_back(handle); }
+        }
+        return out;
+    }
+
+    // A request is about to resume from a disk record: that is real demand at this moment.
+    [[nodiscard]] Admission restore_admission(const Base& base, std::uint32_t frontier) {
+        const CacheRetentionPriority demand{.reused = true, .last_demand = ++clock_};
+        return {.priority = demand, .demand = demand, .base = &base, .frontier = frontier};
+    }
+
+    // A checkpoint rebuilt from disk enters as a public prefix carrying the restoring demand.
+    void publish_restored(Program& program, Handle handle, CacheRetentionPriority priority) {
+        if (!enabled_ || !program.valid_checkpoint(handle)) { return; }
+        const auto summary = program.checkpoint_metadata(handle);
+        shared_.push_back({.handle      = handle,
+                           .ordinal     = ++ordinal_,
+                           .priority    = priority,
+                           .retained_at = ++clock_});
+        index_.insert(program, handle, summary.frontier);
+        balance_reused(program);
+    }
+
+    // Whether resuming from a disk record beats the best resident source. The record costs a
+    // disk read, a Host-to-Device copy of the same bytes, and its own remaining prefill.
+    [[nodiscard]] bool disk_restore_pays(const Source& best, std::size_t bytes,
+                                         std::uint32_t pages, PrefillWork remaining) const {
+        const auto saturating = [](std::uint64_t a, std::uint64_t b) {
+            return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+        };
+        const auto resident = saturating(price_context_transfer_requirements(costs_, best.transfers),
+                                         costs_.prefill_ns(best.remaining_work));
+        const TransferWork copy{.payload_bytes = bytes, .copy_operations = pages + 1U};
+        const auto restore =
+            saturating(saturating(disk_read_ns(bytes),
+                                  costs_.transfer_ns(ContextTransferDirection::HostToDevice, copy)),
+                       costs_.prefill_ns(remaining));
+        return restore < resident;
+    }
+
+    // Generic NVMe read model: 2.5 GB/s plus a fixed submission cost.
+    [[nodiscard]] static std::uint64_t disk_read_ns(std::size_t bytes) noexcept {
+        constexpr std::uint64_t fixed_ns = 200'000;
+        const std::uint64_t streaming    = static_cast<std::uint64_t>(bytes) / 5U * 2U;
+        return streaming > UINT64_MAX - fixed_ns ? UINT64_MAX : streaming + fixed_ns;
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,

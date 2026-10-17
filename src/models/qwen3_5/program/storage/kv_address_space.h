@@ -218,6 +218,28 @@ public:
         return KVAddressSpaceHandle(this, index, address.generation);
     }
 
+    // Makes restored pages (the disk tier) the complete directory of an empty inactive address.
+    // Each page already carries the one address reference this directory owns.
+    void install_inactive(KVAddressSpaceHandle handle, std::span<const LogicalKVPageHandle> pages,
+                          std::uint32_t committed_frontier) {
+        Address& address = require(handle);
+        if (address.active || address.row || address.reservation.valid() ||
+            address.page_count != 0 || pages.size() > page_capacity_ ||
+            pages_for_tokens(committed_frontier) != pages.size()) {
+            throw std::logic_error("KV restore directory is not installable");
+        }
+        for (std::uint32_t index = 0; index < pages.size(); ++index) {
+            if (!pages_->valid(pages[index])) {
+                throw std::logic_error("KV restore directory page is stale");
+            }
+            directory_slot(address.directory, index) = pages[index];
+        }
+        address.page_count          = static_cast<std::uint32_t>(pages.size());
+        address.committed_frontier  = committed_frontier;
+        address.checkpoint_frontier = 0;
+        rebuild_checkpoint_protection();
+    }
+
     [[nodiscard]] bool valid(KVAddressSpaceHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < addresses_.size() &&
                addresses_[handle.index_].occupied &&

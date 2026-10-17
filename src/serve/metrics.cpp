@@ -229,6 +229,33 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "StateImages in the shared Host backing.");
     GAUGE(host_kv_occupied_bytes, "host_kv_used_bytes",
           "KV bytes in the shared Host backing, a subset of used bytes.");
+    GAUGE(disk_context_capacity_bytes, "disk_context_capacity_bytes",
+          "Disk context tier capacity; 0 when the tier is disabled.");
+    GAUGE(disk_context_occupied_bytes, "disk_context_used_bytes",
+          "Occupied disk context bytes, including an in-flight write.");
+    GAUGE(disk_context_records, "disk_context_records", "Checkpoints held on the disk tier.");
+    COUNTER(disk_context_writes, "disk_context_writes_total",
+            "Completed write-behind copies of Host checkpoints to disk.");
+    COUNTER(disk_context_write_bytes, "disk_context_write_bytes_total",
+            "Bytes written by completed write-behind copies.");
+    COUNTER(disk_context_writes_discarded, "disk_context_writes_discarded_total",
+            "Write-behind copies discarded because a copied Host replica changed or I/O failed.");
+    COUNTER(disk_context_restores, "disk_context_restores_total",
+            "Disk checkpoints rebuilt into Host for an admitted request.");
+    COUNTER(disk_context_restore_bytes, "disk_context_restore_bytes_total",
+            "Host bytes rebuilt from the disk tier.");
+    COUNTER(disk_context_evictions, "disk_context_evictions_total",
+            "Disk records evicted to make room for newer copies.");
+    COUNTER(disk_context_io_errors, "disk_context_io_errors_total",
+            "Disk tier read or write failures; the affected copy or restore is abandoned.");
+    COUNTER(disk_context_restores_declined_resident, "disk_context_restores_declined_resident_total",
+            "Admission evaluations whose disk match was no deeper than a resident source.");
+    COUNTER(disk_context_restores_declined_busy, "disk_context_restores_declined_busy_total",
+            "Admission evaluations whose deeper disk match waited for another restore or transfer.");
+    COUNTER(disk_context_restores_declined_cost, "disk_context_restores_declined_cost_total",
+            "Admission evaluations whose deeper disk match was priced above recomputing.");
+    COUNTER(disk_context_restores_declined_host, "disk_context_restores_declined_host_total",
+            "Admission evaluations whose deeper disk match could not get Host room.");
 #undef GAUGE
 #undef COUNTER
 

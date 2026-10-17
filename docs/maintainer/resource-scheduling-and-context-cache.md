@@ -69,6 +69,7 @@ Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和�
 | `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
 | `context_cache.device_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
 | `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+| `context_cache.disk_capacity_bytes` / `disk_directory` | Host 之下可选的 NVMe 层（[7.5](#disk-tier)），缺省 0 = 关闭 |
 | `context_cache.host_state_storage` | Host StateImage 中 GDN recurrent state 的编码（FP32 / BF16 / NVFP4 G16），缺省为 BF16；Device state 始终为 FP32 |
 
 Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
@@ -364,6 +365,32 @@ retired once the chain resumes past them. Rules, metrics and the CUA evaluation 
 [Context checkpoints for CUA workloads](cua-context-checkpoints.md); that page also covers
 `--ctx-checkpoint-boundaries turns`, which places the checkpoints of agent-loop requests that mark
 none themselves.
+
+<a id="disk-tier"></a>
+### 7.5 Disk tier
+
+`--disk-context-mib N` 在 Host 之下增加一层 NVMe，缺省关闭。它是 **write-behind 副本**，不改变
+Host 的保留与回收：
+
+- **写入**：Host 占用超过 85% 时，Engine 在主循环里按 `ResourceManager::disk_write_candidates()`
+  （回收将删除的冷→热顺序，只含之后仍可能被续接的点：未被链上更深点取代、且为链头或已有重复需求的
+  公共点，以及 owner 已有重复需求的私有点；被取代的链点与一次性请求的私有终点不写）挑选 State 与
+  覆盖所需的 Main/backend KV 页全部驻留在 Host、且磁盘尚无同一语义 key 的完整检查点，单次至多约 1 GiB，交给一个 I/O 线程复制。同一 history 的多个点共用一份
+  KV 副本。复制只读 Host replica，不持 pin、不阻塞绑定或回收；完成后控制线程核对每个被复制的
+  StateImage slot 与 KV page replica（capability、offset、epoch、覆盖）未变，否则整份丢弃。
+- **索引**：磁盘记录的身份（ledger、digest、identity tag、frontier）全部留在内存，匹配与
+  `checkpoint_matches` 相同，不读磁盘。
+- **恢复**：新请求接纳前，若磁盘上的最深匹配比所有驻留来源更深，且“磁盘读 + H2D + 剩余 prefill”
+  低于最佳驻留来源的价格，Engine 以该请求的真实需求为 admission 腾出 Host（与 capture 相同的
+  Host victim 规则）。Native 在控制线程上预留全部目的：checkpoint 槽、Host StateImage slot、
+  只含引用的 KV 页和未发布的 Host extent；独立的读线程把字节读进这些预留，期间请求留在队列，
+  其他请求照常执行。读完后主循环发布 extent，重建 StateImage、KV 页与独立 history，作为
+  `SharedPrefix` 发布并重新触发接纳扫描，请求随后按同一选择与绑定路径使用它。同时至多一个恢复；
+  读失败或预留失败则撤销全部预留，请求照常从驻留来源或 root 开始。磁盘记录保留，可再次恢复。
+- **容量**：磁盘写满时按最近使用（写入或恢复）淘汰记录；共享 KV 副本在最后一个记录释放时归还。
+  文件以 `O_TMPFILE` 创建并在启动时 `posix_fallocate` 全部容量，进程退出即消失，不跨重启复用。
+- **代价**：未被删除的点也会写一份副本；恢复期间该请求等待读完（约 0.1–0.4 s/GiB），其预留的
+  Host 字节在此期间计入占用。写与读各用一个线程，恢复不会排在大批写入之后。
 
 <a id="scheduling"></a>
 ## 8. 调度、抢占与恢复

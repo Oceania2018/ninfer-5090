@@ -95,7 +95,28 @@ public:
         for (const LogicalKVPageHandle page : membership) {
             if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
         }
+        return reserve(pages, membership);
+    }
 
+    // Reserves the Host replica of restored pages, which have no Device replica to copy from.
+    // The caller fills writable_view from the disk tier before publish.
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_restore(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+        if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            return std::nullopt;
+        }
+        for (const LogicalKVPageHandle page : membership) {
+            if (!pages.valid(page) || pages.host_resident(page) || pages.device_resident(page) ||
+                pages.source_pins(page) != 0) {
+                return std::nullopt;
+            }
+        }
+        return reserve(pages, membership);
+    }
+
+private:
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    reserve(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
         const HostKVPageLayout& layout = page_layout(pages);
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
@@ -135,6 +156,7 @@ public:
         return reservation;
     }
 
+public:
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {
         validate(reservation);
         return arena_->writable_view(*extents_[reservation.descriptor_].allocation);

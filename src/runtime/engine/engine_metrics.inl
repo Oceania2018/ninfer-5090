@@ -181,6 +181,17 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
     snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.disk_context_occupied_bytes      = physical.disk_occupied_bytes;
+    snapshot.disk_context_capacity_bytes      = physical.disk_capacity_bytes;
+    snapshot.disk_context_records             = physical.disk_records;
+    const auto disk                           = instance_.program->disk_stats();
+    snapshot.disk_context_writes              = disk.writes;
+    snapshot.disk_context_write_bytes         = disk.write_bytes;
+    snapshot.disk_context_writes_discarded    = disk.writes_discarded;
+    snapshot.disk_context_restores            = disk.restores;
+    snapshot.disk_context_restore_bytes       = disk.restore_bytes;
+    snapshot.disk_context_evictions           = disk.evictions;
+    snapshot.disk_context_io_errors           = disk.io_errors;
     const auto& lineage                       = resources_.lineage_stats();
     snapshot.ctx_checkpoint_retired_public    = lineage.retired_public;
     snapshot.ctx_checkpoint_retired_private   = lineage.retired_private;
