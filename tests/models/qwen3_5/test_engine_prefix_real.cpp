@@ -1,13 +1,16 @@
 #include "ninfer/engine.h"
 #include "kv_cache_storage.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -512,6 +515,81 @@ int exercise_host_restore(const char* artifact) {
 
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
     // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
+    return 0;
+}
+
+ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse);
+
+// Disk tier: a write-behind copy of a Host checkpoint survives its deletion from Host and is
+// rebuilt for a later request. The disk copy holds the same bytes as the Host replica, so the
+// result must equal a disk-less engine resuming the same point from Host, token for token.
+int exercise_disk_tier(const char* artifact) {
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_disk_tier_real";
+    const auto prompt    = [](std::uint32_t index) {
+        return std::vector<ninfer::TokenId>(384, static_cast<ninfer::TokenId>(5834 + 7 * index));
+    };
+    auto continuation = prompt(0);
+    continuation.insert(continuation.end(), 8, 198);
+    const auto settle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); };
+
+    ninfer::GenerationResult from_disk;
+    ninfer::RuntimeStats disk_stats;
+    {
+        auto options                              = host_restore_engine_options(artifact);
+        options.context_cache.disk_capacity_bytes = 2ULL << 30;
+        options.context_cache.disk_directory      = directory;
+        ninfer::Engine engine(options);
+        if (engine.options().context_cache.disk_directory != directory) {
+            std::cerr << "disk tier did not report its resolved directory\n";
+            return 1;
+        }
+        // Every prompt is sent twice: the write-behind copies only points with proven repeat
+        // demand, and Host keeps such points until newer repeated history displaces them. Prompt 0
+        // has the oldest demand, so it is copied first and later leaves Host.
+        for (std::uint32_t index = 0; index < 6; ++index) {
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                (void)engine.generate(engine.prepare_tokens(prompt(index)), fixed_output(2, true));
+                settle();
+            }
+        }
+        const auto before = engine.runtime_stats();
+        from_disk         = engine.generate(engine.prepare_tokens(continuation), fixed_output(6, true));
+        disk_stats        = engine.runtime_stats();
+        std::cout << "disk tier writes=" << disk_stats.disk_context_writes
+                  << " discarded=" << disk_stats.disk_context_writes_discarded
+                  << " records=" << disk_stats.disk_context_records
+                  << " restores=" << disk_stats.disk_context_restores
+                  << " restore_bytes=" << disk_stats.disk_context_restore_bytes
+                  << " reused=" << from_disk.reused_prompt_tokens
+                  << " io_errors=" << disk_stats.disk_context_io_errors << '\n';
+        if (disk_stats.disk_context_capacity_bytes != (2ULL << 30) ||
+            disk_stats.disk_context_writes == 0 || disk_stats.disk_context_io_errors != 0 ||
+            disk_stats.disk_context_restores != before.disk_context_restores + 1 ||
+            from_disk.reused_prompt_tokens != 384 || from_disk.generated_token_ids.size() != 6) {
+            std::cerr << "disk tier did not rebuild the deleted Host checkpoint\n";
+            return 1;
+        }
+        if (!std::filesystem::is_empty(directory)) {
+            std::cerr << "disk tier left a named file in its directory\n";
+            return 1;
+        }
+    }
+
+    // Control: the same point resumed from its Host replica in an engine without the tier.
+    ninfer::Engine control(host_restore_engine_options(artifact));
+    (void)control.generate(control.prepare_tokens(prompt(0)), fixed_output(2, true));
+    (void)control.generate(control.prepare_tokens(prompt(0)), fixed_output(2, true));
+    (void)control.generate(control.prepare_tokens(prompt(1)), fixed_output(2, true));
+    const auto from_host = control.generate(control.prepare_tokens(continuation), fixed_output(6, true));
+    if (control.runtime_stats().disk_context_capacity_bytes != 0 ||
+        from_host.reused_prompt_tokens != from_disk.reused_prompt_tokens ||
+        from_host.generated_token_ids != from_disk.generated_token_ids) {
+        std::cerr << "disk restore diverged from Host restore: reused "
+                  << from_disk.reused_prompt_tokens << " vs " << from_host.reused_prompt_tokens
+                  << '\n';
+        return 1;
+    }
+    std::filesystem::remove_all(directory);
     return 0;
 }
 
@@ -1975,6 +2053,8 @@ int main() {
         result = exercise_late_instructions(artifact);
     } else if (scenario == "agent-continuation") {
         result = exercise_agent_continuation(artifact);
+    } else if (scenario == "disk-tier") {
+        result = exercise_disk_tier(artifact);
     } else if (scenario == "explicit-prefix") {
         result = exercise_explicit_prefix(artifact);
     } else if (scenario == "explicit-anchor") {

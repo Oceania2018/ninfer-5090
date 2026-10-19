@@ -41,6 +41,10 @@ std::size_t SequencePlan::host_capacity_bytes() const noexcept {
     return impl_ ? impl_->context_cache.host_capacity_bytes.value_or(0) : 0;
 }
 
+std::filesystem::path SequencePlan::disk_directory() const {
+    return impl_ ? impl_->context_cache.disk_directory : std::filesystem::path{};
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -224,6 +228,16 @@ std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
 
 void Program::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
 
+std::vector<float> Program::score_tail(SequenceHandle h, std::span<const TokenId> candidates) {
+    return impl_->score_tail(h, candidates);
+}
+
+std::vector<float> Program::score_branches(SequenceHandle h,
+                                           std::span<const std::vector<TokenId>> branches,
+                                           std::span<const TokenId> candidates) {
+    return impl_->score_branches(h, branches, candidates);
+}
+
 bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
 
 ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
@@ -297,6 +311,30 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
+
+bool Program::disk_enabled() const noexcept { return impl_->disk_enabled(); }
+
+bool Program::disk_write_pending() const noexcept { return impl_->disk_write_pending(); }
+
+bool Program::start_disk_write(std::span<const CheckpointHandle> coldest) {
+    return impl_->start_disk_write(coldest);
+}
+
+bool Program::poll_disk_write() noexcept { return impl_->poll_disk_write(); }
+
+std::optional<DiskMatch> Program::disk_match(const RequestBasePlan& base) const {
+    return impl_->disk_match(base);
+}
+
+bool Program::disk_restore_pending() const noexcept { return impl_->disk_restore_pending(); }
+
+bool Program::start_disk_restore(const DiskMatch& match) {
+    return impl_->start_disk_restore(match);
+}
+
+DiskRestoreProgress Program::poll_disk_restore() noexcept { return impl_->poll_disk_restore(); }
+
+DiskStats Program::disk_stats() const noexcept { return impl_->disk_stats(); }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {

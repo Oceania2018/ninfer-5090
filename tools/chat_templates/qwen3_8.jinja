@@ -127,6 +127,9 @@ continuation, and accept tool-result histories whose original user turn was remo
         {%- set reasoning_content = reasoning_content|trim %}
         {%- if not continuing and (preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index) %}
             {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- elif continuing and enable_thinking is defined and enable_thinking is false %}
+            {#- Same opener as the non-thinking generation prompt; without it the model ends the turn. #}
+            {{- '<|im_start|>' + message.role + '\n<think>\n\n</think>\n\n' + content }}
         {%- else %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}

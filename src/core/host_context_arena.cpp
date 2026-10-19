@@ -72,11 +72,24 @@ std::size_t HostContextArena::allocation_bytes(std::size_t bytes) const noexcept
     return rounded < minimum_bytes_ ? 0 : rounded;
 }
 
-std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes) const noexcept {
+std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes,
+                                                              HostPlacement placement) const noexcept {
+    if (placement == HostPlacement::High) {
+        for (std::size_t index = free_extents_.size(); index > 0; --index) {
+            if (free_extents_[index - 1].bytes >= bytes) { return index - 1; }
+        }
+        return std::nullopt;
+    }
     for (std::size_t index = 0; index < free_extents_.size(); ++index) {
         if (free_extents_[index].bytes >= bytes) { return index; }
     }
     return std::nullopt;
+}
+
+std::size_t HostContextArena::largest_free_bytes() const noexcept {
+    std::size_t largest = 0;
+    for (const auto& extent : free_extents_) { largest = std::max(largest, extent.bytes); }
+    return largest;
 }
 
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
@@ -84,14 +97,20 @@ bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     return rounded != 0 && find_free_extent(rounded).has_value();
 }
 
-std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
+std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes,
+                                                               HostPlacement placement) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0) { return std::nullopt; }
-    const auto free_index = find_free_extent(rounded);
+    const auto free_index = find_free_extent(rounded, placement);
     if (!free_index) { return std::nullopt; }
-    FreeExtent& free         = free_extents_[*free_index];
-    const std::size_t offset = free.offset;
-    free.offset += rounded;
+    FreeExtent& free = free_extents_[*free_index];
+    std::size_t offset;
+    if (placement == HostPlacement::High) {
+        offset = free.offset + free.bytes - rounded;
+    } else {
+        offset = free.offset;
+        free.offset += rounded;
+    }
     free.bytes -= rounded;
     if (free.bytes == 0) {
         free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));

@@ -148,6 +148,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
     }
     options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
+    options.context_cache.disk_directory      = sequence.disk_directory();
     instance->kv_capacity_resolution          = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);

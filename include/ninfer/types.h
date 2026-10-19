@@ -153,6 +153,14 @@ struct ContextCacheOptions {
     // lies after every shared prefix point. Agent loops that rebuild the trailing screenshot turn
     // every request never resume from those points, which hold the image's KV and a StateImage.
     bool skip_media_tail = false;
+    // NVMe tier below Host. Cold complete checkpoints are written here instead of being deleted
+    // when Host runs low, and read back into Host when a request resumes from one. 0 disables
+    // the tier (the default). Content is process-private and does not survive a restart.
+    std::size_t disk_capacity_bytes = 0;
+    // Directory of the unnamed disk context file. Empty selects
+    // $XDG_CACHE_HOME/ninfer/disk-context (else $HOME/.cache/ninfer/disk-context); Engine::options()
+    // returns the resolved directory. Ignored when disk_capacity_bytes is 0.
+    std::filesystem::path disk_directory;
 };
 
 struct ContextCostOptions {
@@ -184,6 +192,9 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    // Branches evaluated per score_branches pass (0 disables branch scoring, at most 256). Each
+    // row keeps a private KV table row and about one KV page; unset selects 100.
+    std::optional<std::uint32_t> score_branch_rows;
     StartupObserver startup_observer;
 };
 
@@ -260,11 +271,24 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+// Upper bound on ExecutionOptions::score_candidates; System One choice questions allow 255 options.
+inline constexpr std::size_t kMaximumScoreCandidates = 256;
+// Upper bounds on ExecutionOptions::score_branches: branch count and tokens per branch.
+inline constexpr std::size_t kMaximumScoreBranches     = 256;
+inline constexpr std::size_t kMaximumScoreBranchTokens = 5;
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // When non-empty, the result reports log p(token | prompt) at the prompt frontier for each id,
+    // normalized over the full vocabulary and taken from the raw (unconstrained) logits.
+    std::vector<TokenId> score_candidates;
+    // When non-empty (requires score_candidates), each branch is appended to the prompt on its
+    // own and the candidates are scored at the end of prompt + branch instead of at the prompt
+    // frontier. Branches share the prompt's computed state; none of them extends the request.
+    std::vector<std::vector<TokenId>> score_branches;
 };
 
 struct OutputOptions {
@@ -924,6 +948,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+    // One entry per ExecutionOptions::score_candidates id, in request order; empty otherwise.
+    // With score_branches, branch-major: entry [b * candidates + c].
+    std::vector<float> candidate_logprobs;
 };
 
 struct ArenaMemorySummary {
@@ -1035,6 +1062,9 @@ struct RuntimeStats {
     std::uint64_t active_captures_aborted   = 0;
     // Optional captures dropped because no admissible space could be reclaimed for them.
     std::uint64_t captures_skipped          = 0;
+    // Host releases made because free bytes sufficed for a capture's StateImage but no single
+    // free extent did.
+    std::uint64_t captures_defragmented = 0;
     // Per-chain checkpoint bounding (ContextCacheOptions::ctx_checkpoints).
     std::uint64_t ctx_checkpoint_retired_public   = 0;
     std::uint64_t ctx_checkpoint_retired_private  = 0;
@@ -1094,7 +1124,28 @@ struct RuntimeStats {
     std::size_t host_context_reserved_bytes = 0;
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
+    // Largest single free Host extent and the number of free extents.
+    std::size_t host_context_largest_free_bytes = 0;
+    std::size_t host_context_free_extents       = 0;
     double actual_context_transfer_seconds       = 0.0;
+    // Disk tier (all zero when disabled). Occupied bytes include an in-flight write.
+    std::size_t disk_context_occupied_bytes        = 0;
+    std::size_t disk_context_capacity_bytes        = 0;
+    std::uint32_t disk_context_records             = 0;
+    std::uint64_t disk_context_writes              = 0;
+    std::uint64_t disk_context_write_bytes         = 0;
+    std::uint64_t disk_context_writes_discarded    = 0;
+    std::uint64_t disk_context_restores            = 0;
+    std::uint64_t disk_context_restore_bytes       = 0;
+    std::uint64_t disk_context_evictions           = 0;
+    std::uint64_t disk_context_io_errors           = 0;
+    // Admission evaluations whose deepest disk match was not restored, by first reason: a resident
+    // source already reached as deep, another restore or context transaction was in flight,
+    // recomputing was priced cheaper, or Host room could not be made.
+    std::uint64_t disk_context_restores_declined_resident = 0;
+    std::uint64_t disk_context_restores_declined_busy     = 0;
+    std::uint64_t disk_context_restores_declined_cost     = 0;
+    std::uint64_t disk_context_restores_declined_host     = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

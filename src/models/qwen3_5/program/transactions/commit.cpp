@@ -551,6 +551,7 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         device.synchronize();
     } catch (...) {}
     abort_context();
+    abort_disk_restore();
     pending_transaction_.reset();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (requests[lane].lifecycle != Lifecycle::Empty) {

@@ -322,6 +322,35 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     }
 }
 
+void causal_conv1d_silu_branch_split(const Tensor& x, const Tensor& weight,
+                                     const Tensor& conv_state, std::int32_t width, Tensor& out0,
+                                     Tensor& out1, Tensor& out2, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_state.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: x/weight/conv_state must be BF16");
+    }
+    require_x_shape(x);
+    require_weight_shape(weight, x.ne[0]);
+    require_state_shape(conv_state, x.ne[0]);
+    if (width < 1 || width > detail::kCausalConvParallelMaxTokens || x.ne[1] % width != 0) {
+        throw std::invalid_argument("causal_conv1d: branch width must divide the columns and lie "
+                                    "in [1,32]");
+    }
+    const detail::CausalConvSplitGeometry geometry = resolve_split_geometry(x, out0, out1, out2);
+    if (numel_allow_zero(x, "x") == 0) { return; }
+
+    const std::pair<const Tensor*, const char*> operands[6] = {
+        {&x, "x"},       {&weight, "weight"}, {&conv_state, "conv_state"},
+        {&out0, "out0"}, {&out1, "out1"},     {&out2, "out2"}};
+    for (const auto& operand : operands) {
+        require_accessible(*operand.first, operand.second);
+        require_pair_aligned(*operand.first, operand.second);
+    }
+    // The state is read-only here, so passing it as both state operands applies the same rule.
+    require_split_nonoverlap(x, weight, conv_state, conv_state, out0, out1, out2);
+    detail::causal_conv1d_branch_split_launch(x, weight, conv_state, width, out0, out1, out2,
+                                              geometry, stream);
+}
+
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
                         cudaStream_t stream) {
     const std::int64_t n = validate_common(x, weight, conv_state, out);

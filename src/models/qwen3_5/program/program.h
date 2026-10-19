@@ -65,6 +65,7 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
+    [[nodiscard]] std::filesystem::path disk_directory() const;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;
@@ -392,8 +393,42 @@ struct PhysicalUsageSnapshot {
     runtime::ContextResourceUsage capacity;
     std::size_t host_reserved_bytes      = 0;
     std::size_t host_peak_occupied_bytes = 0;
+    std::size_t host_largest_free_bytes  = 0;
+    std::size_t host_free_extents        = 0;
     std::uint32_t host_state_slots       = 0;
     std::size_t host_kv_bytes            = 0;
+    // Disk tier (zero when disabled). Occupied bytes include an in-flight write.
+    std::size_t disk_occupied_bytes = 0;
+    std::size_t disk_capacity_bytes = 0;
+    std::uint32_t disk_records      = 0;
+};
+
+// Cumulative disk-tier counters since startup.
+struct DiskStats {
+    std::uint64_t writes           = 0;
+    std::uint64_t write_bytes      = 0;
+    std::uint64_t writes_discarded = 0;
+    std::uint64_t restores         = 0;
+    std::uint64_t restore_bytes    = 0;
+    std::uint64_t evictions        = 0;
+    std::uint64_t io_errors        = 0;
+};
+
+struct DiskRestoreProgress {
+    bool finished = false;
+    // The rebuilt Host-only SharedPrefix checkpoint; empty when the restore failed.
+    std::optional<CheckpointHandle> checkpoint;
+};
+
+// The deepest disk record matching a request, found from RAM metadata only.
+struct DiskMatch {
+    std::uint32_t record   = 0;
+    std::uint32_t frontier = 0;
+    // Host bytes a restore allocates (StateImage plus every KV page it covers).
+    std::size_t host_bytes = 0;
+    std::uint32_t kv_pages = 0;
+    // Prefill left after resuming from the record, priced like a resident source.
+    runtime::PrefillWork remaining_work;
 };
 
 class Program {
@@ -449,6 +484,15 @@ public:
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
     void skip_capture(SequenceHandle sequence);
+    // log p(id | prompt) for each candidate at the completed prompt frontier of this sequence,
+    // normalized over the public vocabulary; out-of-vocabulary ids report -infinity.
+    [[nodiscard]] std::vector<float> score_tail(SequenceHandle sequence,
+                                                std::span<const TokenId> candidates);
+    // For each branch, log p(id | prompt + branch) for every candidate, branch-major. Branches are
+    // evaluated from the completed prompt frontier without changing the sequence's KV or state.
+    [[nodiscard]] std::vector<float>
+    score_branches(SequenceHandle sequence, std::span<const std::vector<TokenId>> branches,
+                   std::span<const TokenId> candidates);
     // Finite physical actions, each including every optional holder needed for its release.
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
                                                   std::span<const CheckpointHandle> excluded,
@@ -491,6 +535,24 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+
+    // Disk tier. All calls are no-ops when it is disabled.
+    [[nodiscard]] bool disk_enabled() const noexcept;
+    [[nodiscard]] bool disk_write_pending() const noexcept;
+    // Starts one background copy of the first eligible Host-resident checkpoints in `coldest`
+    // (coldest first) that the disk does not already hold. Returns false when nothing started.
+    [[nodiscard]] bool start_disk_write(std::span<const CheckpointHandle> coldest);
+    // Publishes or discards a finished copy; returns true when one finished.
+    bool poll_disk_write() noexcept;
+    [[nodiscard]] std::optional<DiskMatch> disk_match(const RequestBasePlan& base) const;
+    // Rebuilds the record as a Host-only SharedPrefix checkpoint without blocking execution: start
+    // reserves every Host destination (the caller makes room for DiskMatch::host_bytes first) and
+    // a reader thread fills them; poll installs the checkpoint once the read finished. One restore
+    // runs at a time. The caller publishes the handle to the resource manager.
+    [[nodiscard]] bool disk_restore_pending() const noexcept;
+    [[nodiscard]] bool start_disk_restore(const DiskMatch& match);
+    [[nodiscard]] DiskRestoreProgress poll_disk_restore() noexcept;
+    [[nodiscard]] DiskStats disk_stats() const noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl> impl_;

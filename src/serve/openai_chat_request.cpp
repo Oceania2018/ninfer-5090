@@ -822,6 +822,65 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
     }
 }
 
+// NInfer extension: score single-token candidates at the prompt frontier. Scoring needs only the
+// first generated position, so an unspecified output budget defaults to one token.
+void parse_score_candidates(const Json& body, OpenAIChatRequest& output) {
+    constexpr const char* param = "ninfer_score_candidates";
+    if (!body.contains(param) || body.at(param).is_null()) { return; }
+    const Json& value = body.at(param);
+    if (!value.is_array() || value.empty() || value.size() > ninfer::kMaximumScoreCandidates) {
+        bad_request(std::string(param) + " must be an array of 1 to " +
+                        std::to_string(ninfer::kMaximumScoreCandidates) + " strings",
+                    param);
+    }
+    for (const Json& item : value) {
+        if (!item.is_string() || item.get_ref<const std::string&>().empty()) {
+            bad_request(std::string(param) + " items must be nonempty strings", param);
+        }
+        output.generation.score_candidates.push_back(item.get<std::string>());
+    }
+    if (output.stream) { bad_request(std::string(param) + " requires stream=false", param); }
+    if (!output.output_tokens_explicit) { output.generation.max_tokens = 1; }
+}
+
+// NInfer extension: score the candidates after each branch continuation of the prompt.
+void parse_score_branches(const Json& body, OpenAIChatRequest& output) {
+    constexpr const char* param = "ninfer_score_branches";
+    if (!body.contains(param) || body.at(param).is_null()) { return; }
+    const Json& value = body.at(param);
+    if (!value.is_array() || value.empty() || value.size() > ninfer::kMaximumScoreBranches) {
+        bad_request(std::string(param) + " must be an array of 1 to " +
+                        std::to_string(ninfer::kMaximumScoreBranches) + " strings",
+                    param);
+    }
+    if (output.generation.score_candidates.empty()) {
+        bad_request(std::string(param) + " requires ninfer_score_candidates", param);
+    }
+    for (const Json& item : value) {
+        if (!item.is_string() || item.get_ref<const std::string&>().empty()) {
+            bad_request(std::string(param) + " items must be nonempty strings", param);
+        }
+        output.generation.score_branches.push_back(item.get<std::string>());
+    }
+}
+
+// vLLM-compatible assistant prefill: generation continues the final assistant message in place.
+void parse_continue_final_message(const Json& body, GenerationRequest& request) {
+    if (!get_bool(body, "continue_final_message", false)) { return; }
+    if (request.messages.empty() || request.messages.back().role != ChatRole::Assistant) {
+        bad_request("continue_final_message requires a final assistant message",
+                    "continue_final_message");
+    }
+    const ChatTurn& final = request.messages.back();
+    if (final.content.empty() || !final.reasoning_content.empty() || !final.tool_calls.empty() ||
+        std::any_of(final.content.begin(), final.content.end(),
+                    [](const ContentPart& part) { return part.kind != ContentKind::Text; })) {
+        bad_request("a final assistant prefill must contain only text", "messages",
+                    "assistant_prefill_not_supported");
+    }
+    request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+}
+
 } // namespace
 
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
@@ -843,11 +902,14 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, output.generation);
+    parse_continue_final_message(body, output.generation);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);
+    parse_score_candidates(body, output);
+    parse_score_branches(body, output);
     parse_reasoning_effort(body, output.generation);
     const TemplateOptions template_options      = parse_template_options(body);
     output.generation.enable_thinking           = template_options.enable_thinking;

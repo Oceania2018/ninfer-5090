@@ -16,6 +16,8 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
+#include "core/disk_context_store.h"
+#include "core/host_worker_pool.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -244,6 +247,92 @@ struct CheckpointSlot {
     bool reserved            = false;
 };
 
+// One immutable extent of the disk context file, shared by every record that references it.
+struct DiskBlob {
+    DiskExtent extent;
+};
+
+// Pages of one typed KV pool stored back to back at that pool's Host page stride.
+struct DiskKVCopy {
+    std::shared_ptr<const DiskBlob> blob;
+    // Committed frontier of the restored address and the committed columns of each of its pages.
+    // The blob may hold more pages when a deeper record of the same history shares it.
+    std::uint32_t coverage = 0;
+    std::vector<std::uint32_t> columns;
+};
+
+// A complete checkpoint copied to the disk tier. Identity and keys stay in RAM, so matching a
+// request never reads the disk; only a restore does.
+struct DiskCheckpointRecord {
+    std::shared_ptr<const PreparedCaptureBacking> identity;
+    PrefixShortlistKey key;
+    std::uint32_t frontier         = 0;
+    std::uint32_t backend_frontier = 0;
+    std::int32_t rope_delta        = 0;
+    bool tail_hidden_valid         = false;
+    std::shared_ptr<const DiskBlob> state;
+    DiskKVCopy main;
+    std::optional<DiskKVCopy> backend;
+    std::uint64_t last_used = 0;
+};
+
+// A background copy of Host-resident checkpoints. The worker only reads Host replicas; the
+// control thread publishes the records after checking that no copied replica changed meanwhile.
+struct DiskWriteJob {
+    struct StateToken {
+        StateImageHandle state;
+        qwen3_5::HostStateSlotHandle slot;
+    };
+
+    struct PageToken {
+        const LogicalKVPageStore* pages = nullptr;
+        LogicalKVPageHandle page;
+        HostKVPageReplica replica;
+    };
+
+    struct Segment {
+        const std::byte* source = nullptr;
+        std::size_t bytes       = 0;
+        const DiskBlob* blob    = nullptr;
+        std::size_t offset      = 0;
+    };
+
+    std::vector<DiskCheckpointRecord> records;
+    std::vector<StateToken> states;
+    std::vector<PageToken> pages;
+    std::size_t bytes = 0;
+    std::future<void> done;
+};
+
+// A rebuild of one disk record into Host. Every destination is reserved on the control thread
+// before the reader fills it; nothing becomes reachable until poll_disk_restore installs it.
+struct DiskRestoreJob {
+    struct Segment {
+        const DiskBlob* blob     = nullptr;
+        std::size_t offset       = 0;
+        std::byte* destination   = nullptr;
+        std::size_t bytes        = 0;
+    };
+
+    struct Pool {
+        std::vector<LogicalKVPageHandle> pages;
+        std::vector<HostKVExtentReservation> extents;
+    };
+
+    // A copy: its blobs keep the source extents alive if the record is evicted meanwhile.
+    DiskCheckpointRecord record;
+    std::size_t host_bytes = 0;
+    CheckpointHandle checkpoint;
+    std::optional<qwen3_5::HostStateSlotHandle> slot;
+    std::optional<StateImageHandle> state;
+    bool state_referenced = false;
+    Pool main;
+    Pool backend;
+    std::optional<KVAddressSpaceHandle> text;
+    std::optional<KVAddressSpaceHandle> backend_address;
+    std::future<void> done;
+};
+
 struct ResumeStateImpl {
     ProgramImpl* owner = nullptr;
     std::optional<CheckpointHandle> snapshot;
@@ -301,6 +390,10 @@ public:
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
     void skip_capture(SequenceHandle);
+    [[nodiscard]] std::vector<float> score_tail(SequenceHandle, std::span<const TokenId>);
+    [[nodiscard]] std::vector<float> score_branches(SequenceHandle,
+                                                    std::span<const std::vector<TokenId>>,
+                                                    std::span<const TokenId>);
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   runtime::ContextResourceUsage) const;
@@ -336,6 +429,22 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+
+    [[nodiscard]] bool disk_enabled() const noexcept { return disk_store != nullptr; }
+
+    [[nodiscard]] bool disk_write_pending() const noexcept { return disk_job.has_value(); }
+
+    [[nodiscard]] bool start_disk_write(std::span<const CheckpointHandle> coldest);
+    bool poll_disk_write() noexcept;
+    [[nodiscard]] std::optional<DiskMatch> disk_match(const RequestBasePlan&) const;
+    [[nodiscard]] bool disk_restore_pending() const noexcept { return disk_restore.has_value(); }
+
+    [[nodiscard]] bool start_disk_restore(const DiskMatch&);
+    [[nodiscard]] DiskRestoreProgress poll_disk_restore() noexcept;
+    void abort_disk_restore() noexcept;
+    void unwind_disk_restore(DiskRestoreJob&) noexcept;
+
+    [[nodiscard]] DiskStats disk_stats() const noexcept { return disk_counters; }
 
     const execution::Parameters& parameters;
     DeviceContext& device;
@@ -373,6 +482,18 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // score_branches: pass I/O plus KV table rows and tail pages leased for the whole Program
+    // lifetime. Declared after decoder so its leases release first.
+    struct ScoreBranchScratch {
+        std::int32_t row_count = 0;
+        Tensor inputs;
+        Tensor targets;
+        Tensor logprobs;
+        std::vector<KVExecutionRowLease> rows;
+        std::vector<DeviceKVPageLease> pages;
+        PinnedHostBuffer host;
+    };
+    std::optional<ScoreBranchScratch> score_scratch;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -492,6 +613,18 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily speculative_forward_graphs;
     DecodeGraphFamily speculative_finish_graphs;
+
+    // Disk tier, null when disabled. Declared last so the I/O worker, which reads Host replicas,
+    // joins before any Host store is destroyed; records release their extents before the store.
+    std::unique_ptr<DiskContextStore> disk_store;
+    std::vector<DiskCheckpointRecord> disk_records;
+    std::optional<DiskWriteJob> disk_job;
+    std::optional<DiskRestoreJob> disk_restore;
+    DiskStats disk_counters;
+    std::uint64_t disk_clock = 0;
+    // Writes and restores use separate threads so a restore never queues behind a large write.
+    std::unique_ptr<HostWorkerPool> disk_io;
+    std::unique_ptr<HostWorkerPool> disk_reader;
 
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,

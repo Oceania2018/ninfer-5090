@@ -8,12 +8,15 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
@@ -775,5 +778,221 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
 }
 
+std::vector<float> ProgramImpl::score_tail(SequenceHandle handle,
+                                           std::span<const TokenId> candidates) {
+    if (!valid_sequence(handle)) { throw std::logic_error("score_tail has a stale lane"); }
+    const SequenceState& sequence = active_sequence(ContractAccess::lane(handle).value);
+    if (!sequence.tail_hidden_valid) {
+        throw std::logic_error("score_tail requires a completed prompt frontier");
+    }
+    // Re-project the frontier hidden instead of reusing sampled logits: the sampling path may
+    // have masked or penalized them, and the zero-suffix path never materializes them here.
+    const auto rows = static_cast<std::size_t>(parameters.model.resources().public_token_count);
+    mark_workspace_usage(workspace_plan.ordinary_round);
+    work.reset();
+    Tensor logits = io.logits.slice(1, 0, 1);
+    execution::project(sequence.tail_hidden, parameters.text.output_head, logits, work,
+                       device.stream);
+    std::vector<std::uint16_t> host(rows);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), logits.data, rows * sizeof(std::uint16_t),
+                               cudaMemcpyDeviceToHost, device.stream));
+    device.synchronize();
+    work.reset();
+
+    const auto value = [&](std::size_t row) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(host[row]) << 16;
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+    };
+    float peak = -std::numeric_limits<float>::infinity();
+    for (std::size_t row = 0; row < rows; ++row) { peak = std::max(peak, value(row)); }
+    if (!std::isfinite(peak)) { throw std::runtime_error("score_tail produced non-finite logits"); }
+    double sum = 0.0;
+    for (std::size_t row = 0; row < rows; ++row) { sum += std::exp(double(value(row)) - peak); }
+    const double log_z = double(peak) + std::log(sum);
+
+    std::vector<float> scores;
+    scores.reserve(candidates.size());
+    for (const TokenId id : candidates) {
+        scores.push_back(id >= 0 && static_cast<std::size_t>(id) < rows
+                             ? static_cast<float>(double(value(static_cast<std::size_t>(id))) - log_z)
+                             : -std::numeric_limits<float>::infinity());
+    }
+    return scores;
+}
+
+// Each pass evaluates up to score_branch_rows branches in one wide Verify-shaped forward. Every
+// row starts from the sequence's prompt-frontier StateImage slot (read, never written) and attends
+// through a private KV table row: the prompt's full pages are shared read-only, and the partial
+// tail page is copied once into the row's private pages, where the branch appends its own K/V.
+// Rows per pass depend only on the frontier, so equal requests always run the same passes.
+std::vector<float> ProgramImpl::score_branches(SequenceHandle handle,
+                                               std::span<const std::vector<TokenId>> branches,
+                                               std::span<const TokenId> candidates) {
+    if (!valid_sequence(handle)) { throw std::logic_error("score_branches has a stale lane"); }
+    if (!score_scratch) { throw std::logic_error("branch scoring is not planned for this model"); }
+    if (branches.empty() || branches.size() > kMaximumScoreBranches || candidates.empty() ||
+        candidates.size() > kMaximumScoreCandidates) {
+        throw std::invalid_argument("score_branches request is outside its planned bounds");
+    }
+    ScoreBranchScratch& score = *score_scratch;
+    SequenceState& sequence   = active_sequence(ContractAccess::lane(handle).value);
+    if (sequence.state.fork_pending) {
+        throw std::logic_error("score_branches requires a settled prompt-frontier state");
+    }
+    // Every row is padded to the request's longest branch, and to the two columns the ReplaySSM
+    // recurrence needs, so equal requests always run the same shape.
+    std::size_t longest = 2;
+    for (const auto& branch : branches) { longest = std::max(longest, branch.size()); }
+    if (longest > kMaximumScoreBranchTokens) {
+        throw std::invalid_argument("score branch length is outside its planned width");
+    }
+    const auto W                 = static_cast<std::int32_t>(longest);
+    constexpr auto page_size     = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    if (frontier == 0) { throw std::logic_error("score_branches requires a prompt frontier"); }
+    if (frontier + static_cast<std::uint32_t>(W) > capacity) {
+        // No room to append a branch: every candidate is unreachable rather than failing the
+        // Engine loop, which owns this call.
+        return std::vector<float>(branches.size() * candidates.size(),
+                                  -std::numeric_limits<float>::infinity());
+    }
+    const auto vocabulary =
+        static_cast<std::int32_t>(parameters.model.resources().public_token_count);
+    for (const auto& branch : branches) {
+        if (branch.empty() || branch.size() > kMaximumScoreBranchTokens) {
+            throw std::invalid_argument("score branch length is outside its planned width");
+        }
+        for (const TokenId token : branch) {
+            if (token < 0 || token >= vocabulary) {
+                throw std::invalid_argument("score branch token is outside the vocabulary");
+            }
+        }
+    }
+
+    mark_workspace_usage(workspace_plan.score_branches);
+    work.reset();
+    DeviceKVPagePool& pool         = decoder->text_kv.page_pool();
+    KVExecutionTablePool& tables   = decoder->text_kv.execution_tables();
+    const std::uint32_t full_pages = frontier / page_size;
+    const bool partial_tail        = frontier % page_size != 0;
+    // Private pages cover [full_pages * page_size, frontier + W); W fits in two pages. A branch
+    // that crosses a page boundary halves the rows per pass so that every row gets two.
+    const std::uint32_t private_pages =
+        (frontier + static_cast<std::uint32_t>(W) - 1U) / page_size + 1U - full_pages;
+    const std::size_t rows = std::min<std::size_t>(static_cast<std::size_t>(score.row_count),
+                                                   score.pages.size() / private_pages);
+    if (private_pages > 2U || rows == 0) {
+        throw std::logic_error("score branch tail exceeds its private pages");
+    }
+    const std::size_t stride = static_cast<std::size_t>(score.row_count);
+    const auto input_words   = static_cast<std::size_t>(score_branch_input_words(score.row_count));
+    std::vector<DeviceKVPageHandle> table(full_pages + private_pages);
+    for (std::uint32_t page = 0; page < full_pages; ++page) {
+        table[page] = text_kv_addresses->physical_page(sequence.kv->text, page);
+    }
+    const auto used_rows =
+        static_cast<std::int32_t>(std::min<std::size_t>(branches.size(), rows));
+    for (std::int32_t row = 0; row < used_rows; ++row) {
+        for (std::uint32_t page = 0; page < private_pages; ++page) {
+            table[full_pages + page] =
+                score.pages[static_cast<std::size_t>(row) * private_pages + page].handle();
+        }
+        if (partial_tail) {
+            (void)pool.copy_page(text_kv_addresses->physical_page(sequence.kv->text, full_pages),
+                                 table[full_pages], device.stream);
+        }
+        tables.publish(score.rows[static_cast<std::size_t>(row)].handle(), 0,
+                       std::span<const DeviceKVPageHandle>(table), device.stream);
+    }
+
+    // Host staging: per-pass inputs, the shared candidate-id matrix, then per-pass logprobs.
+    // Each pass owns its own staging region so asynchronous uploads never observe a rewrite.
+    const std::size_t passes = (branches.size() + rows - 1) / rows;
+    auto* host_inputs        = static_cast<std::int32_t*>(score.host.data());
+    auto* host_targets       = host_inputs + passes * input_words;
+    auto* host_logprobs =
+        reinterpret_cast<float*>(host_targets + stride * kMaximumScoreCandidates);
+    const std::size_t count = candidates.size();
+    for (std::size_t c = 0; c < count; ++c) {
+        // Out-of-vocabulary candidates read a valid row and are reported as -infinity below.
+        const TokenId id = candidates[c] >= 0 && candidates[c] < vocabulary ? candidates[c] : 0;
+        for (std::size_t row = 0; row < stride; ++row) { host_targets[c * stride + row] = id; }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(score.targets.data, host_targets,
+                               count * stride * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                               device.stream));
+
+    const std::int32_t state_slot = state_selectors(sequence).source;
+    execution::TextContext card(device, parameters, work, text_kv_view(sequence),
+                                state_images->linear(), io, prefill_hidden, prefill_chunk, frontier,
+                                PagedKVCacheView(), &decoder->text_kv, nullptr);
+    card.set_linear_state_slots(state_slot, state_slot);
+    std::vector<std::int32_t> last_columns(rows);
+    for (std::size_t pass = 0; pass < passes; ++pass) {
+        const std::size_t first = pass * rows;
+        const auto batch        = static_cast<std::int32_t>(
+            std::min<std::size_t>(rows, branches.size() - first));
+        std::int32_t* in        = host_inputs + pass * input_words;
+        std::int32_t* ids       = in;
+        std::int32_t* cache_pos = ids + W * batch;
+        std::int32_t* rope_pos  = cache_pos + W * batch;
+        std::int32_t* valid     = rope_pos + W * batch;
+        std::int32_t* kv_rows   = valid + batch;
+        std::int32_t* slots     = kv_rows + batch;
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const auto& branch = branches[first + static_cast<std::size_t>(row)];
+            const auto length  = static_cast<std::int32_t>(branch.size());
+            for (std::int32_t column = 0; column < W; ++column) {
+                // Columns past the branch are inert; they repeat its last token.
+                ids[row * W + column]       = branch[static_cast<std::size_t>(std::min(column, length - 1))];
+                cache_pos[row * W + column] = static_cast<std::int32_t>(frontier) + column;
+                rope_pos[row * W + column] =
+                    static_cast<std::int32_t>(frontier) + column + sequence.rope_delta;
+            }
+            valid[row]        = length;
+            kv_rows[row]      = score.rows[static_cast<std::size_t>(row)].row_index();
+            slots[row]        = state_slot;
+            last_columns[row] = length - 1;
+        }
+        const auto words = static_cast<std::size_t>(3 * W * batch + 3 * batch);
+        CUDA_CHECK(cudaMemcpyAsync(score.inputs.data, in, words * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, device.stream));
+        const auto device_i32 = [&](std::int32_t offset, std::int32_t elements) {
+            return score.inputs.slice(0, offset, elements);
+        };
+        const Tensor d_ids       = device_i32(0, W * batch).view({W, batch});
+        const Tensor d_cache_pos = device_i32(W * batch, W * batch).view({W, batch});
+        const Tensor d_rope_pos  = device_i32(2 * W * batch, W * batch).view({W, batch});
+        const Tensor d_valid     = device_i32(3 * W * batch, batch);
+        const Tensor d_kv_rows   = device_i32(3 * W * batch + batch, batch);
+        const Tensor d_slots     = device_i32(3 * W * batch + 2 * batch, batch);
+        card.score_branch_batch(
+            d_ids, d_cache_pos, d_rope_pos, d_valid, d_kv_rows, d_slots,
+            {1, frontier + static_cast<std::uint32_t>(W)},
+            std::span<const std::int32_t>(last_columns.data(), static_cast<std::size_t>(batch)),
+            score.targets, static_cast<std::int32_t>(count), vocabulary, score.logprobs);
+        CUDA_CHECK(cudaMemcpyAsync(host_logprobs + pass * stride * kMaximumScoreCandidates,
+                                   score.logprobs.data, count * stride * sizeof(float),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+    device.synchronize();
+    work.reset();
+
+    std::vector<float> scores(branches.size() * count);
+    for (std::size_t branch = 0; branch < branches.size(); ++branch) {
+        const std::size_t pass = branch / rows;
+        const std::size_t row  = branch % rows;
+        const float* pass_logprobs = host_logprobs + pass * stride * kMaximumScoreCandidates;
+        for (std::size_t c = 0; c < count; ++c) {
+            const bool in_vocabulary = candidates[c] >= 0 && candidates[c] < vocabulary;
+            scores[branch * count + c] = in_vocabulary
+                                             ? pass_logprobs[c * stride + row]
+                                             : -std::numeric_limits<float>::infinity();
+        }
+    }
+    return scores;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

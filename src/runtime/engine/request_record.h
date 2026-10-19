@@ -220,6 +220,9 @@ struct RequestRecord {
     std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
+    // Filled once when the initial prefill reaches the prompt frontier (options.execution
+    // .score_candidates); a replayed prefill after preemption does not rescore.
+    std::optional<std::vector<float>> candidate_logprobs;
 
     std::mutex mutex;
     std::condition_variable cv;

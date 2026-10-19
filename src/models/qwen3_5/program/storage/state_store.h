@@ -205,6 +205,25 @@ public:
         return require(handle).host_slot.has_value();
     }
 
+    [[nodiscard]] std::optional<qwen3_5::HostStateSlotHandle>
+    host_slot(StateImageHandle handle) const {
+        return require(handle).host_slot;
+    }
+
+    // Adopts a published Host slot whose bytes were restored from outside the Program (the disk
+    // tier) as a new immutable Host-only image. The caller retains its checkpoint reference.
+    [[nodiscard]] std::optional<StateImageHandle>
+    install_host_checkpoint(qwen3_5::HostStateSlotHandle slot) noexcept {
+        if (host_ == nullptr) { return std::nullopt; }
+        std::optional<StateImageHandle> handle =
+            allocate(StateImageRole::CheckpointImmutable, false);
+        if (!handle) { return std::nullopt; }
+        Object& object       = objects_[handle->index_];
+        object.host_slot     = slot;
+        object.content_epoch = next_epoch();
+        return handle;
+    }
+
     [[nodiscard]] std::uint64_t content_epoch(StateImageHandle handle) const {
         return require(handle).content_epoch;
     }

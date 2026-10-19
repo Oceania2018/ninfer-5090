@@ -193,6 +193,12 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    // Texts that must each encode to exactly one token; their log probabilities at the prompt
+    // frontier are returned with the outcome (ninfer_score_candidates).
+    std::vector<std::string> score_candidates;
+    // Optional continuations (ninfer_score_branches), each 1 to 5 tokens: candidates are scored
+    // after prompt + branch for every branch instead of at the prompt frontier.
+    std::vector<std::string> score_branches;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None &&

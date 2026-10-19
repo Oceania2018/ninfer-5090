@@ -38,6 +38,34 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
+    if (options.execution.score_candidates.size() > kMaximumScoreCandidates) {
+        throw std::invalid_argument("score_candidates allows at most " +
+                                    std::to_string(kMaximumScoreCandidates) + " token ids");
+    }
+    if (!options.execution.score_candidates.empty() &&
+        options.execution.requested_output_tokens == 0) {
+        throw std::invalid_argument("score_candidates requires at least one output token");
+    }
+    if (options.execution.score_branches.size() > kMaximumScoreBranches) {
+        throw std::invalid_argument("score_branches allows at most " +
+                                    std::to_string(kMaximumScoreBranches) + " branches");
+    }
+    if (!options.execution.score_branches.empty() && options.execution.score_candidates.empty()) {
+        throw std::invalid_argument("score_branches requires score_candidates");
+    }
+    for (const auto& branch : options.execution.score_branches) {
+        if (branch.empty() || branch.size() > kMaximumScoreBranchTokens) {
+            throw std::invalid_argument("each score branch must have 1 to " +
+                                        std::to_string(kMaximumScoreBranchTokens) + " tokens");
+        }
+    }
+    resolved.execution.score_candidates = std::move(options.execution.score_candidates);
+    resolved.execution.score_branches   = std::move(options.execution.score_branches);
+    // Branch scoring computes the whole prompt: a restored prefix may differ numerically from a
+    // fresh prefill (compressed StateImages), and identical requests must score identically.
+    if (!resolved.execution.score_branches.empty()) {
+        resolved.execution.allow_prefix_reuse = false;
+    }
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.constraint                        = options.constraint;

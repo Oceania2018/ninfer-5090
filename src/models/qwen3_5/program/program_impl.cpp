@@ -77,6 +77,39 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
     }
+    if (plan.persistent.score_branches) {
+        const ScoreBranchLayout& layout = *plan.persistent.score_branches;
+        const auto rows                 = static_cast<std::int32_t>(plan.score_branch_rows);
+        const std::uint32_t pages       = score_branch_pages(plan.score_branch_rows);
+        // Fewest rows a pass can take: half of the pages when every branch needs two.
+        const std::size_t minimum_rows =
+            std::min<std::size_t>(static_cast<std::size_t>(rows), pages / 2U);
+        const std::size_t passes = (kMaximumScoreBranches + minimum_rows - 1) / minimum_rows;
+        const std::size_t matrix = static_cast<std::size_t>(rows) * kMaximumScoreCandidates;
+        const std::size_t host_bytes =
+            passes * static_cast<std::size_t>(score_branch_input_words(rows)) *
+                sizeof(std::int32_t) +
+            matrix * sizeof(std::int32_t) + passes * matrix * sizeof(float);
+        ScoreBranchScratch& score = score_scratch.emplace(ScoreBranchScratch{
+            .row_count = rows,
+            .inputs    = layout.inputs.bind(backing),
+            .targets   = layout.targets.bind(backing),
+            .logprobs  = layout.logprobs.bind(backing),
+            .rows      = {},
+            .pages     = {},
+            .host      = PinnedHostBuffer(host_bytes),
+        });
+        KVExecutionTablePool& tables = decoder->text_kv.execution_tables();
+        DeviceKVPagePool& pool       = decoder->text_kv.page_pool();
+        for (std::int32_t row = 0; row < rows; ++row) {
+            score.rows.push_back(tables.acquire(static_cast<std::int32_t>(max_concurrency) + row));
+        }
+        std::optional<DeviceKVPageReservation> reservation = pool.reserve(pages);
+        if (!reservation) { throw std::bad_alloc(); }
+        for (std::uint32_t page = 0; page < pages; ++page) {
+            score.pages.push_back(pool.materialize_one(*reservation));
+        }
+    }
     if (plan.persistent.dflash) {
         auto* local = state_images->dflash_local();
         if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }
@@ -124,6 +157,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     state_store =
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
+    // The disk tier copies Host replicas of cross-request history.
+    if (plan.context_cache.disk_capacity_bytes != 0) {
+        if (host_bytes == 0 || !plan.context_cache.enabled) {
+            throw std::invalid_argument(
+                "the disk context tier requires prefix reuse and a nonzero Host context budget");
+        }
+        disk_store = std::make_unique<DiskContextStore>(plan.context_cache.disk_directory,
+                                                        plan.context_cache.disk_capacity_bytes);
+        disk_io     = std::make_unique<HostWorkerPool>(1, 1);
+        disk_reader = std::make_unique<HostWorkerPool>(1, 1);
+    }
     const auto logical_pages = [&](const DeviceKVPagePool& pool) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
         return checked_count(pool.capacity_pages() + host_bytes / stride);
@@ -231,6 +275,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    abort_disk_restore();
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }

@@ -256,6 +256,20 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["timings"] = timings_json(outcome_timings(outcome));
     if (outcome.constraint)
         payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (!outcome.candidate_logprobs.empty() && outcome.score_branch_count == 0) {
+        // Same order as the request's ninfer_score_candidates.
+        payload["ninfer_candidate_logprobs"] = outcome.candidate_logprobs;
+    } else if (!outcome.candidate_logprobs.empty()) {
+        // One row per ninfer_score_branches entry, each in ninfer_score_candidates order.
+        const std::size_t width = outcome.candidate_logprobs.size() / outcome.score_branch_count;
+        Json rows               = Json::array();
+        for (std::size_t branch = 0; branch < outcome.score_branch_count; ++branch) {
+            const auto begin = outcome.candidate_logprobs.begin() +
+                               static_cast<std::ptrdiff_t>(branch * width);
+            rows.push_back(std::vector<float>(begin, begin + static_cast<std::ptrdiff_t>(width)));
+        }
+        payload["ninfer_candidate_logprobs"] = std::move(rows);
+    }
     return payload.dump();
 }
 

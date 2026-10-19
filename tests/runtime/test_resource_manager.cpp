@@ -1435,6 +1435,26 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
             "publishing the newly learned Shared point lost its actual demand evidence");
 }
 
+// An agent task's next step decides its capture before its own commit is observed. The previous
+// step's crossing of the same prefix already makes this the second request there.
+void test_capture_by_a_second_request_counts_as_demand() {
+    Fixture f(0);
+    const Base incoming{.tokens = tokens(3, 1000), .captures = {2}};
+    f.cache.observe_committed(incoming, 7, 0, 3);
+    require(!f.cache.capture_admission(f.program, 0, incoming, 2, false).priority.reused,
+            "a capture without its request id borrowed the first crossing");
+    require(!f.cache.capture_admission(f.program, 0, incoming, 2, false, false, 7)
+                 .priority.reused,
+            "the request that crossed first counted its own crossing as demand");
+    require(f.cache.capture_admission(f.program, 0, incoming, 2, false, false, 8)
+                .priority.reused,
+            "a second request capturing a crossed prefix carried no demand");
+    const Base unrelated{.tokens = tokens(3, 5000), .captures = {2}};
+    require(!f.cache.capture_admission(f.program, 0, unrelated, 2, false, false, 8)
+                 .priority.reused,
+            "an uncrossed prefix carried demand");
+}
+
 void test_optional_capture_budget_spans_host_and_device_actions() {
     Fixture f(64);
     const auto host = f.program.add(tokens(60, 1000), {f.program.host_block(64)});
@@ -1996,6 +2016,93 @@ void test_lineage_keeps_a_shallower_recap_point_for_the_next_task() {
             "the previous task's head survived, or the new recap point was lost");
 }
 
+// The disk tier copies only points a later request can resume from, in reclaim order, and a point
+// rebuilt from disk enters as a public prefix carrying the demand of the request that restored it.
+void test_disk_tier_order_publication_and_pricing() {
+    Fixture f(64);
+    const auto cold = f.program.add({1}, {f.program.host_block(16)});
+    const auto hot  = f.program.add({2}, {f.program.host_block(16)});
+    f.publish(cold);
+    f.publish(hot);
+    f.use_shared(hot);
+    require(f.cache.disk_write_candidates() == std::vector<Handle>{hot},
+            "disk write-behind copied an unadopted one-off point or missed a reused one");
+
+    const Base base{.tokens = {1, 7, 8, 9, 10}};
+    const auto demand = f.cache.restore_admission(base, 4);
+    require(demand.demand.reused && demand.priority.reused && demand.frontier == 4 &&
+                demand.base == &base,
+            "restoring request does not carry real demand");
+    const auto restored = f.program.add({1, 7, 8, 9}, {f.program.host_block(16)});
+    f.cache.publish_restored(f.program, restored, demand.demand);
+    const auto choices = f.cache.candidates(f.program, base);
+    require(choices.front().source.checkpoint == restored &&
+                choices.front().source.reused_tokens == 4,
+            "restored disk point is not the preferred resident source");
+    require(f.cache.disk_write_candidates() == std::vector<Handle>({hot, restored}),
+            "restored point is not ordered after older demand");
+    require(f.cache.host_victims(f.program, 32, std::nullopt) == std::vector<Handle>{cold},
+            "host reclaim does not take the cold point before the restored one");
+
+    // Fixture prefill costs 1 ns per token and transfers are free; a disk read costs 0.2 ms
+    // plus 0.4 ns per byte, so it pays only against a long remaining prefill.
+    const auto source = [](std::uint64_t tokens) {
+        Source out;
+        out.remaining_work = ninfer::runtime::make_prefill_work(0, tokens, 0, 0, 2048);
+        return out;
+    };
+    const auto none = ninfer::runtime::make_prefill_work(4, 0, 0, 0, 2048);
+    require(!f.cache.disk_restore_pays(source(1000), 1U << 20, 1, none),
+            "disk restore chosen over a short resident prefill");
+    require(f.cache.disk_restore_pays(source(10'000'000), 1U << 20, 1, none),
+            "disk restore rejected against a long resident prefill");
+    require(!f.cache.disk_restore_pays(source(10'000'000), 1U << 20, 1,
+                                       ninfer::runtime::make_prefill_work(0, 10'000'000, 0, 0,
+                                                                          2048)),
+            "disk restore chosen without saving any prefill");
+}
+
+// A chain's head and a reused root are copied to disk; superseded chain points and the private
+// endpoint of a request without repeat demand are not.
+void test_disk_tier_skips_superseded_and_one_off_points() {
+    Fixture f(0, 2);
+    const auto system = f.program.add(tokens(100));
+    f.publish(system);
+    std::vector<LoopStep> steps{loop_step(f, system, 150, 1)};
+    for (std::uint32_t step = 2; step <= 4; ++step) {
+        steps.push_back(loop_step(f, steps.back().history, 150 + 10 * step, step));
+    }
+    const Base one_off{.tokens = tokens(30, 777777)};
+    const auto lone     = f.program.add(one_off.tokens, {}, Role::Continuation);
+    const auto stranger = f.begin(one_off);
+    f.cache.publish(f.program, stranger, lone);
+    f.cache.finish(f.program, stranger, one_off, f.next_order);
+
+    const auto copied = f.cache.disk_write_candidates();
+    const auto has    = [&](Handle handle) {
+        return std::find(copied.begin(), copied.end(), handle) != copied.end();
+    };
+    require(has(system), "disk write-behind skipped the reused root");
+    require(has(steps.back().history), "disk write-behind skipped the chain head");
+    require(f.program.valid_checkpoint(steps[2].history) && !has(steps[2].history),
+            "disk write-behind copied a superseded chain point");
+    require(!has(lone), "disk write-behind copied a one-off private endpoint");
+}
+
+// The reuse tier keeps 3/4 of Host and demotes the oldest demand; that demoted point is the next
+// Host victim, so the disk tier must still copy it.
+void test_disk_tier_copies_demand_demoted_from_the_reuse_tier() {
+    Fixture f(64);
+    std::vector<Handle> points;
+    for (int index = 0; index < 3; ++index) {
+        points.push_back(f.program.add({static_cast<int>(10 + index)}, {f.program.host_block(20)}));
+        f.publish(points.back());
+        f.use_shared(points.back());
+    }
+    require(f.cache.disk_write_candidates() == points,
+            "disk write-behind dropped demand the reuse tier demoted");
+}
+
 void test_lineage_point_adopted_twice_is_a_branch_and_kept() {
     Fixture f(0, 1);
     const auto system = f.program.add(tokens(100));
@@ -2058,6 +2165,9 @@ int main() {
         test_lineage_head_survives_one_off_captures();
         test_lineage_keeps_a_shallower_recap_point_for_the_next_task();
         test_lineage_point_adopted_twice_is_a_branch_and_kept();
+        test_disk_tier_order_publication_and_pricing();
+        test_disk_tier_skips_superseded_and_one_off_points();
+        test_disk_tier_copies_demand_demoted_from_the_reuse_tier();
         test_lineage_bound_disabled_keeps_previous_behavior();
         test_lineage_capture_inherits_the_extended_points_demand();
         test_demotion_competes_with_its_actual_host_recovery_loss();
@@ -2083,6 +2193,7 @@ int main() {
         test_optional_capture_does_not_inherit_required_eviction_rights();
         test_physical_host_alias_uses_all_holders_priority();
         test_committed_repeated_demand_admits_a_new_short_working_set();
+        test_capture_by_a_second_request_counts_as_demand();
         test_cold_writeback_protects_reused_history();
         test_host_preflight_counts_aliases_and_has_no_partial_deletion();
         test_candidates_keep_all_frontiers_and_independent_contents();

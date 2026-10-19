@@ -777,6 +777,9 @@ private:
         result.tool_call_parse                 = request->output.tool_call_parse_diagnostics();
         result.reasoning_tokens                = request->output.reasoning_tokens();
         result.finish_reason                   = reason;
+        if (request->candidate_logprobs) {
+            result.candidate_logprobs = std::move(*request->candidate_logprobs);
+        }
         result.matched_stop_string             = request->output.matched_stop_string();
         if (request->begin) {
             result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
@@ -1060,6 +1063,7 @@ private:
                                    static_cast<std::ptrdiff_t>(row * pending.row_stride());
                 request->generated.insert(request->generated.end(), first,
                                           first + static_cast<std::ptrdiff_t>(accepted));
+                round_diag(*request, decode_round, std::span<const TokenId>(&*first, accepted));
             }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -1225,6 +1229,25 @@ private:
         context_owner_ = request;
     }
 
+    // Committed-token trace on stderr, one line per commit, enabled with NINFER_ROUND_DIAG=1:
+    // "[round-diag] req=<id> decode=<0|1> n=<count> ids=<a,b,...>". Used to see how many tokens
+    // each speculative verify round lands, and which of them a grammar fixed.
+    void round_diag(const Request& request, bool decode_round, std::span<const TokenId> tokens) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_ROUND_DIAG");
+            return value && *value == '1';
+        }();
+        if (!enabled) { return; }
+        std::string ids;
+        for (const TokenId token : tokens) {
+            if (!ids.empty()) { ids += ','; }
+            ids += std::to_string(token);
+        }
+        std::fprintf(stderr, "[round-diag] req=%llu decode=%d n=%zu ids=%s\n",
+                     static_cast<unsigned long long>(request.id), decode_round ? 1 : 0,
+                     tokens.size(), ids.c_str());
+    }
+
     // Capture-admission trace on stderr, enabled with NINFER_CACHE_DIAG=1.
     template <class Capture>
     void cache_diag(const std::shared_ptr<Request>& request, const Capture& capture,
@@ -1237,12 +1260,13 @@ private:
         const auto usage = instance_.program->physical_usage();
         std::fprintf(stderr,
                      "[cache-diag] req=%llu frontier=%u %s short{state=%u main=%u backend=%u "
-                     "host=%zu} need_host=%zu host_free=%zu demand_reused=%d last=%llu\n",
+                     "host=%zu} need_host=%zu host_free=%zu host_largest=%zu demand_reused=%d "
+                     "last=%llu\n",
                      static_cast<unsigned long long>(request->id), capture.frontier, outcome,
                      capture.shortage.state_slots, capture.shortage.main_kv_pages,
                      capture.shortage.backend_kv_pages, capture.shortage.host_bytes,
                      capture.host_bytes, usage.capacity.host_bytes - usage.occupied.host_bytes,
-                     demand_reused, last_demand);
+                     usage.host_largest_free_bytes, demand_reused, last_demand);
     }
 
     bool prepare_semantic_capture(const std::shared_ptr<Request>& request) {
@@ -1264,7 +1288,7 @@ private:
                 capture->frontier,
                 input_capture && !capture->shortage.main_kv_pages &&
                     !capture->shortage.backend_kv_pages,
-                input_capture);
+                input_capture, request->id);
             if (!decision || decision->frontier != capture->frontier) {
                 decision.emplace(
                     CaptureDecision{*request->sequence, capture->frontier,
@@ -1286,6 +1310,23 @@ private:
                         decision.reset();
                         return true;
                     }
+                }
+            }
+            // Free bytes can cover the StateImage while no single free extent does. Releasing
+            // by the free-byte deficit then frees nothing, so release a whole image's worth of
+            // admissible victims until an extent forms or nothing admissible is left.
+            const auto current = instance_.program->physical_usage();
+            if (capture->host_bytes && capture->host_bytes <= current.capacity.host_bytes &&
+                capture->host_bytes <= current.capacity.host_bytes - current.occupied.host_bytes &&
+                current.host_largest_free_bytes < capture->host_bytes) {
+                const auto freed = resources_.reclaim(
+                    *instance_.program, ContextResourceUsage{.host_bytes = capture->host_bytes},
+                    {}, decision->reclaim);
+                if (freed == ReclaimProgress::Transferring) { return false; }
+                if (freed == ReclaimProgress::Changed) {
+                    ++cumulative_stats_.captures_defragmented;
+                    scheduler_.capacity_released();
+                    continue;
                 }
             }
             const auto progress =
@@ -1347,6 +1388,17 @@ private:
         }
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
+        if (!request->options.execution.score_candidates.empty() &&
+            !request->candidate_logprobs) {
+            // The target tail hidden still holds the prompt frontier until the Begin token commits.
+            const auto& execution = request->options.execution;
+            request->candidate_logprobs =
+                execution.score_branches.empty()
+                    ? instance_.program->score_tail(*request->sequence, execution.score_candidates)
+                    : instance_.program->score_branches(*request->sequence,
+                                                        execution.score_branches,
+                                                        execution.score_candidates);
+        }
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
@@ -1667,6 +1719,94 @@ private:
         }
     }
 
+    // Disk tier write-behind. Past the Host high-water mark, copy the coldest Host-resident points
+    // the disk does not hold yet. Host retention is unchanged: reclaim still deletes them, and a
+    // later request can rebuild one from its disk copy.
+    void maintain_disk_tier() {
+        auto& program = *instance_.program;
+        if (!program.disk_enabled()) { return; }
+        if (disk_restore_request_) {
+            const auto progress = program.poll_disk_restore();
+            if (progress.finished) {
+                if (progress.checkpoint) {
+                    resources_.publish_restored(program, *progress.checkpoint,
+                                                disk_restore_priority_);
+                }
+                // The waiting request is scanned again and now finds the record in Host.
+                disk_restore_request_.reset();
+                request_admission_check();
+            }
+        }
+        if (program.poll_disk_write()) { disk_write_idle_occupancy_ = SIZE_MAX; }
+        if (program.disk_write_pending()) { return; }
+        constexpr std::size_t kHighWaterPercent = 85;
+        const auto usage    = program.physical_usage();
+        const auto capacity = usage.capacity.host_bytes;
+        const auto occupied = usage.occupied.host_bytes;
+        if (capacity == 0 || occupied < capacity / 100 * kHighWaterPercent ||
+            occupied == disk_write_idle_occupancy_) {
+            return;
+        }
+        disk_write_idle_occupancy_ =
+            program.start_disk_write(resources_.disk_write_candidates()) ? SIZE_MAX : occupied;
+    }
+
+    // Starts rebuilding the deepest matching disk record into Host when resuming from it beats
+    // every resident source of this fresh request. The request waits in the queue while a reader
+    // thread fills Host; other requests keep executing. When maintain_disk_tier publishes the
+    // record, the next admission scan finds it as an ordinary resident source.
+    bool start_disk_restore(const Request& request,
+                            std::span<const typename ResourceManagement::SourceChoice> sources) {
+        auto& program = *instance_.program;
+        if (!program.disk_enabled() || sources.empty()) { return false; }
+        const auto match = program.disk_match(*request.base_plan);
+        if (!match) { return false; }
+        // Each declined match is counted once per admission evaluation, by its first reason.
+        if (match->frontier <= sources.front().source.reused_tokens) {
+            ++cumulative_stats_.disk_context_restores_declined_resident;
+            return false;
+        }
+        if (program.disk_restore_pending() || program.has_context_transaction()) {
+            ++cumulative_stats_.disk_context_restores_declined_busy;
+            return false;
+        }
+        if (!resources_.disk_restore_pays(sources.front().source, match->host_bytes,
+                                          match->kv_pages, match->remaining_work)) {
+            ++cumulative_stats_.disk_context_restores_declined_cost;
+            return false;
+        }
+        // Each Host extent and the StateImage round up to the arena alignment.
+        const auto needed = match->host_bytes + (std::size_t{match->kv_pages} + 1U) * 256U;
+        auto usage        = program.physical_usage();
+        if (needed > usage.capacity.host_bytes) {
+            ++cumulative_stats_.disk_context_restores_declined_host;
+            return false;
+        }
+        const auto admission = resources_.restore_admission(*request.base_plan, match->frontier);
+        if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            (void)program.release_redundant_host({});
+            usage = program.physical_usage();
+        }
+        if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            auto cursor        = resources_.begin_reclaim(program, admission);
+            const auto victims = resources_.host_victims(program, needed, std::nullopt, {}, {},
+                                                         admission, &cursor);
+            if (!victims) {
+                ++cumulative_stats_.disk_context_restores_declined_host;
+                return false;
+            }
+            resources_.commit_host_victims(program, *victims, cursor);
+            if (!victims->empty()) { scheduler_.capacity_released(); }
+        }
+        if (!program.start_disk_restore(*match)) {
+            ++cumulative_stats_.disk_context_restores_declined_host;
+            return false;
+        }
+        disk_restore_request_  = request.id;
+        disk_restore_priority_ = admission.demand;
+        return true;
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
@@ -1699,6 +1839,7 @@ private:
                                        request->id};
             if (!admission_decision_) {
                 if (!restoring) {
+                    if (disk_restore_request_ == request->id) { continue; }
                     scheduler_.admission_candidate_checked(request->id);
                     if (request->admission_generation == admission_generation_) { continue; }
                     request->admission_generation = admission_generation_;
@@ -1722,13 +1863,17 @@ private:
                     choice.source.take_private =
                         resources_.can_transfer_private(request->continuation_owner, request->id);
                 } else {
-                    sources = resources_.candidates(*instance_.program, *request->base_plan,
-                                                    restoring ? request->suspended->frontier()
-                                                              : UINT32_MAX,
-                                                    restoring && request->continuation_owner
-                                                        ? std::optional(request->continuation_owner)
-                                                        : std::nullopt,
-                                                    request->id, request->publication_order);
+                    const auto find_sources = [&] {
+                        return resources_.candidates(
+                            *instance_.program, *request->base_plan,
+                            restoring ? request->suspended->frontier() : UINT32_MAX,
+                            restoring && request->continuation_owner
+                                ? std::optional(request->continuation_owner)
+                                : std::nullopt,
+                            request->id, request->publication_order);
+                    };
+                    sources = find_sources();
+                    if (!restoring && start_disk_restore(*request, sources)) { continue; }
                 }
                 if (!restoring && !sources.empty()) {
                     const auto preferred = sources.front().source.reused_tokens;
@@ -2185,6 +2330,7 @@ private:
             materializing_ ? materializing_->request : nullptr;
         // Native retires all transfer readers before any external checkpoint owner is destroyed.
         instance_.program->fail_all_cleanup();
+        disk_restore_request_.reset();
         materializing_.reset();
         admission_decision_.reset();
         for (auto& decision : capture_decisions_) { decision.reset(); }
@@ -2229,6 +2375,7 @@ private:
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
+                maintain_disk_tier();
                 if (!instance_.program->has_context_transaction()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
@@ -2408,6 +2555,11 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
     std::optional<AdmissionDecision> admission_decision_;
+    // Host occupancy at the last write-behind attempt that found nothing to copy.
+    std::size_t disk_write_idle_occupancy_ = SIZE_MAX;
+    // The fresh request whose disk record is being read into Host, and the demand it publishes.
+    std::optional<std::uint64_t> disk_restore_request_;
+    CacheRetentionPriority disk_restore_priority_;
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
     std::shared_ptr<Request> context_owner_;

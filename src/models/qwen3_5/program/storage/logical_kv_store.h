@@ -180,6 +180,27 @@ public:
         return LogicalKVPageHandle(this, index, page.generation);
     }
 
+    // A Host-only page whose bytes come from outside the Program (the disk tier). It carries the
+    // address reference of the history it is installed into; the caller attaches its Host replica
+    // before the page becomes reachable from any checkpoint.
+    [[nodiscard]] LogicalKVPageHandle materialize_host_restore(std::uint32_t committed_columns) {
+        if (committed_columns == 0 ||
+            committed_columns > static_cast<std::uint32_t>(kPagedKVPageSize) || free_count_ == 0) {
+            throw std::invalid_argument("logical KV restore page is invalid");
+        }
+        const std::uint32_t index = free_[--free_count_];
+        Page& page                = pages_[index];
+        if (page.occupied) { std::terminate(); }
+        page.content_epoch     = next_epoch(page.content_epoch);
+        page.committed_columns = committed_columns;
+        page.references        = 1;
+        page.active_references = 0;
+        page.writer_references = 0;
+        page.protected_columns = 0;
+        page.occupied          = true;
+        return LogicalKVPageHandle(this, index, page.generation);
+    }
+
     void publish_transfer_destination(LogicalKVPageHandle handle, bool writer) noexcept {
         if (!valid(handle)) { std::terminate(); }
         Page& page = pages_[handle.index_];
