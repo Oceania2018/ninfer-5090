@@ -100,6 +100,27 @@ Implementation: `note_lineage`, `supersede`, `retire_dead_siblings` and `retire_
 `test_lineage_*` in
 [`test_resource_manager.cpp`](../../tests/runtime/test_resource_manager.cpp).
 
+<a id="lrfu"></a>
+### 4.1 LRFU ranking
+
+`--ctx-lrfu-lambda F` (default `0`, LRU) ranks retained points by LRFU (Lee et al., 2001) instead
+of their last reference alone, and changes what counts as a reference:
+
+| Rule | Effect |
+|---|---|
+| Score | An entry's value is `CRF(t) = sum 2^(-F (t - t_i))` over its references `t_i`, with `t` counted in cache events (about ten per CUA step, side requests included). Ranking by CRF at a common time equals ranking by `t_last + log2(CRF(t_last)) / F`, which is stored as the entry's demand, so every existing demand comparison (victim order, reuse-tier balance, capture admission) ranks by LRFU unchanged. A single reference scores exactly as under LRU. |
+| Ancestor references | A resume of N tokens also references every shallower public point on its path that is not superseded (system prompt, task, recap). Under LRU those age out while each run resumes from its own deeper history, and the next run then prefills its whole prefix cold (§7). |
+| Bound | The frequency bonus is at most about `log2(1 / (F ln 2)) / F` events. With `F = 0.01` a prefix referenced on every step keeps roughly 40 steps of grace after its last run; one referenced every event, at most about 700. |
+
+Superseded chain points stay demoted, and the reuse tier's 3/4 cap still demotes the lowest
+scores, so frequency cannot pin more than that share of a pool.
+
+Implementation: `referenced` and `reference_ancestors` in
+[`resource_manager.h`](../../src/runtime/engine/context_cache/resource_manager.h); unit tests
+`test_lrfu_*` in
+[`test_resource_manager.cpp`](../../tests/runtime/test_resource_manager.cpp). The whole suite also
+passes with LRFU forced on at `F` = 0.01, 0.05 and 0.2.
+
 ## 5. Observability
 
 | Signal | Meaning |
@@ -108,6 +129,7 @@ Implementation: `note_lineage`, `supersede`, `retire_dead_siblings` and `retire_
 | `ninfer_ctx_checkpoint_retired_public_total` | Superseded or dead public chain points retired |
 | `ninfer_ctx_checkpoint_retired_private_total` | Private endpoints and input points retired after the chain diverged |
 | `ninfer_ctx_checkpoint_boosted_capture_admissions_total` | Capture admissions that inherited the extended point's demand |
+| `ninfer_ctx_lrfu_ancestor_references_total` | LRFU references credited to shallower public points of a resumed prefix (§4.1) |
 | `NINFER_CACHE_DIAG=1` | Prints one stderr line per capture decision (`ok-direct`, `ok-host-victims`, `SKIP`) with the shortage, free Host bytes and admission demand |
 
 In CUA traffic, most skipped captures come from one-off grounding requests; that is expected.
@@ -194,7 +216,9 @@ These comparisons were not strictly controlled:
   On the patched node, some system prefixes of rarely used agents were evicted after a few idle
   minutes and computed cold again. Whether protected chain heads of finished walks crowd these roots
   out has not been established. If they do, a bound on the number of protected heads (for example
-  twice the maximum concurrency) is the candidate fix.
+  twice the maximum concurrency) is the candidate fix. LRFU ranking with ancestor references
+  (§4.1) addresses the same symptom from the other side: every step of every run now refreshes
+  the system prefix it passes through.
 - **The replay A/B measured `a3759c4`.** `5bce700` only adds the recap rule and is covered by
   `test_lineage_keeps_a_shallower_recap_point_for_the_next_task`.
 

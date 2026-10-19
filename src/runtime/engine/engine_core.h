@@ -83,7 +83,8 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           resources_(options.context_cache.enabled, std::move(context_cost),
-                     options.context_cache.ctx_checkpoints) {
+                     options.context_cache.ctx_checkpoints,
+                     options.context_cache.ctx_lrfu_lambda) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");

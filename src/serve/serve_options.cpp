@@ -131,7 +131,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N] [--host-state-dtype fp32|bf16|nvfp4] "
            "[--disk-context-mib N] [--disk-context-dir DIR] "
-           "[--ctx-checkpoints N] [--score-branch-rows N] "
+           "[--ctx-checkpoints N] [--ctx-lrfu-lambda F] [--score-branch-rows N] "
            "[--ctx-checkpoint-boundaries off|turns] [--ctx-checkpoint-skip-media-tail on|off] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -174,6 +174,8 @@ std::string serve_usage_text(const char* argv0) {
            "(default bf16; fp32 is exact, nvfp4 is the smallest); Device state stays fp32\n"
            "       --ctx-checkpoints keeps N superseded prefix points per request chain "
            "(default 4, 0 disables)\n"
+           "       --ctx-lrfu-lambda ranks retained checkpoints by LRFU with this decay per cache "
+           "event (default 0 = LRU, at most 1)\n"
            "       --score-branch-rows sets branches per /v1/systemone rank pass (0 disables "
            "rank, at most 256, default 100); each row keeps about one KV page\n"
            "       --ctx-checkpoint-boundaries turns checkpoints the first message, the first "
@@ -294,6 +296,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ctx-checkpoints") {
             options.context_cache.ctx_checkpoints = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ctx-checkpoints"), "ctx-checkpoints"));
+        } else if (arg == "--ctx-lrfu-lambda") {
+            options.context_cache.ctx_lrfu_lambda =
+                parse_float_in(require_value("--ctx-lrfu-lambda"), "ctx-lrfu-lambda", 0.0f, 1.0f);
         } else if (arg == "--ctx-checkpoint-boundaries") {
             const std::string value = require_value("--ctx-checkpoint-boundaries");
             if (value == "off") {

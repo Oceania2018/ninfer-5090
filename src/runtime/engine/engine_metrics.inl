@@ -198,6 +198,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.ctx_checkpoint_retired_public    = lineage.retired_public;
     snapshot.ctx_checkpoint_retired_private   = lineage.retired_private;
     snapshot.ctx_checkpoint_boosted_captures  = lineage.boosted_captures;
+    snapshot.ctx_lrfu_ancestor_references     = lineage.ancestor_references;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;

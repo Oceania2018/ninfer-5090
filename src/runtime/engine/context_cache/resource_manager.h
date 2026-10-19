@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -86,14 +87,21 @@ public:
     // and resumes each step from the previous one exactly once. Without a per-chain bound those
     // adopted-once points stay reuse-tier forever and, once Host is full, starve the next
     // step's capture of admission. See `supersede`.
+    //
+    // `lrfu_lambda` > 0 ranks retained points by LRFU instead of their last reference alone, and
+    // counts a resume as a reference to every shallower public point on its path. See
+    // `referenced` and `reference_ancestors`. 0 keeps LRU.
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
-                             std::uint32_t ctx_checkpoints = 0)
-        : enabled_(enabled), lineage_cap_(ctx_checkpoints), costs_(std::move(costs)) {}
+                             std::uint32_t ctx_checkpoints = 0, double lrfu_lambda = 0)
+        : enabled_(enabled), lineage_cap_(ctx_checkpoints), lrfu_lambda_(lrfu_lambda),
+          costs_(std::move(costs)) {}
 
     struct LineageStats {
         std::uint64_t retired_public  = 0;
         std::uint64_t retired_private = 0;
         std::uint64_t boosted_captures = 0;
+        // LRFU references credited to shallower public points of a resumed path.
+        std::uint64_t ancestor_references = 0;
     };
 
     [[nodiscard]] const LineageStats& lineage_stats() const { return lineage_stats_; }
@@ -391,8 +399,11 @@ public:
                     remember_demand(*key, 0,
                                     CacheRetentionPriority{.reused = true, .last_demand = used_at});
                 }
+                reference_ancestors(program, base, choice.source.reused_tokens, used_at,
+                                    choice.shared_entry);
                 if (auto* owner = find_owner(choice.owner)) {
-                    priority        = {.reused = true, .last_demand = used_at};
+                    // The donor's history is referenced again; a fork carries the same evidence.
+                    priority        = referenced(owner->priority, used_at);
                     proven_frontier = choice.source.reused_tokens;
                     // Consuming a branch replaces its proof. A shallower independent
                     // Fork has its own new evidence and leaves its donor's pair intact.
@@ -402,7 +413,7 @@ public:
                     }
                     if (choice.take_over) { token = owner->token; }
                 } else if (auto* shared = find_shared(choice.shared_entry)) {
-                    shared->priority = {.reused = true, .last_demand = used_at};
+                    shared->priority = referenced(shared->priority, used_at);
                     adopted_shared   = shared;
                 }
             }
@@ -1030,6 +1041,48 @@ private:
         const auto it = std::find_if(shared_.begin(), shared_.end(),
                                      [&](const auto& entry) { return entry.ordinal == ordinal; });
         return it == shared_.end() ? nullptr : &*it;
+    }
+
+    // LRFU (Lee et al., 2001). An entry's combined recency-frequency value is
+    // CRF(t) = sum over its references t_i of 2^(-lambda (t - t_i)). Between references every
+    // entry decays by the same factor, so ranking by CRF at a common time ranks by the constant
+    // t_last + log2(CRF(t_last)) / lambda. That key is stored in last_demand, so every existing
+    // comparison of demand ranks by LRFU unchanged; a single reference gives exactly t_last.
+    // The time unit is a cache event (clock_), about ten per CUA step with its side requests.
+    // The largest bonus, for an entry referenced on every event, is about
+    // log2(1 / (lambda ln 2)) / lambda events.
+    [[nodiscard]] CacheRetentionPriority referenced(CacheRetentionPriority prior,
+                                                    std::uint64_t now) const {
+        CacheRetentionPriority next{
+            .reused = true, .last_demand = now, .referenced_at = now, .crf = 1};
+        if (lrfu_lambda_ <= 0) { return next; }
+        if (prior.crf > 0 && now >= prior.referenced_at) {
+            next.crf += prior.crf * std::exp2(-lrfu_lambda_ *
+                                              static_cast<double>(now - prior.referenced_at));
+        }
+        next.last_demand = now + static_cast<std::uint64_t>(std::log2(next.crf) / lrfu_lambda_);
+        return next;
+    }
+
+    // A resume of `reused` tokens also used every shallower public point on its path (the system
+    // prompt, the task). Under LRU those age out while each run resumes from its own deeper
+    // history, and the next run then prefills its whole prefix cold. Superseded chain points are
+    // left demoted: their contents are covered by the head that replaced them.
+    void reference_ancestors(Program& program, const Base& base, std::uint32_t reused,
+                             std::uint64_t now, std::uint64_t adopted_shared) {
+        if (lrfu_lambda_ <= 0) { return; }
+        for (const auto handle : index_.matches(program, base)) {
+            if (!program.valid_checkpoint(handle) ||
+                program.checkpoint_metadata(handle).frontier >= reused) {
+                continue;
+            }
+            for (auto& entry : shared_) {
+                if (entry.handle == handle && entry.ordinal != adopted_shared && !entry.superseded) {
+                    entry.priority = referenced(entry.priority, now);
+                    ++lineage_stats_.ancestor_references;
+                }
+            }
+        }
     }
 
     // Where this request sits in a chain of public points. Resuming from a non-root public
@@ -1908,6 +1961,7 @@ private:
 
     bool enabled_;
     std::uint32_t lineage_cap_ = 0;
+    double lrfu_lambda_        = 0;
     // Diagnostics only; counted from const admission queries too.
     mutable LineageStats lineage_stats_;
     ContextMachineCostModel costs_;

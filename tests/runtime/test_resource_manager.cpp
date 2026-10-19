@@ -535,10 +535,11 @@ struct Fixture {
     Cache cache;
     std::uint64_t next_order = 0;
 
-    explicit Fixture(std::size_t capacity, std::uint32_t ctx_checkpoints = 0)
+    explicit Fixture(std::size_t capacity, std::uint32_t ctx_checkpoints = 0,
+                     double lrfu_lambda = 0)
         : program{.host_capacity = capacity},
           cache(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}},
-                ctx_checkpoints) {}
+                ctx_checkpoints, lrfu_lambda) {}
 
     Cache::SourceChoice source(const Base& base, std::optional<Handle> desired,
                                std::optional<Token> resume = {}) {
@@ -2157,6 +2158,65 @@ void test_lineage_capture_inherits_the_extended_points_demand() {
             "the chain's next capture did not inherit the extended point's demand");
 }
 
+// A run of agent steps over a shared system prompt, then one later request that publishes and
+// reuses an unrelated point once. Returns the Host victim chosen when one block is needed.
+std::vector<Handle> lrfu_victim_after_a_run(double lambda, Handle* system_out, Handle* other_out,
+                                            std::uint64_t* ancestor_references) {
+    Fixture f(256, 4, lambda);
+    const auto system = f.program.add(tokens(100), {f.program.host_block(100)});
+    f.publish(system);
+    auto head = loop_step(f, system, 150, 1);
+    for (std::uint32_t step = 2; step <= 6; ++step) {
+        head = loop_step(f, head.history, 150 + 10 * step, step);
+    }
+    const auto other = f.program.add(tokens(50, 800000), {f.program.host_block(100)});
+    f.publish(other);
+    f.use_shared(other);
+    *system_out          = system;
+    *other_out           = other;
+    *ancestor_references = f.cache.lineage_stats().ancestor_references;
+    return *f.cache.host_victims(f.program, 100, std::nullopt);
+}
+
+void test_lrfu_shared_prefix_outranks_a_newer_single_use() {
+    Handle system{}, other{};
+    std::uint64_t references = 0;
+    // LRU: the system prompt was last adopted by the run's first step; every later step resumed
+    // from its own history, so the newer single-use point outranks it.
+    auto victims = lrfu_victim_after_a_run(0, &system, &other, &references);
+    require(victims == std::vector<Handle>{system} && references == 0,
+            "LRU baseline changed: the system prompt should be the colder point");
+    // LRFU: steps 2-6 each passed through the system prompt, which counts as five more
+    // references; their frequency outweighs the few events since the last one.
+    victims = lrfu_victim_after_a_run(0.05, &system, &other, &references);
+    require(victims == std::vector<Handle>{other},
+            "LRFU evicted the shared system prompt before a newer single-use point");
+    // Only the root is credited: earlier history points were superseded by the chain head.
+    require(references == 5, "ancestor references touched superseded chain points");
+}
+
+void test_lrfu_decay_lets_an_idle_prefix_age_out() {
+    // The bonus is bounded: after enough newer references the old prefix is colder again.
+    Fixture f(256, 4, 0.05);
+    const auto system = f.program.add(tokens(100), {f.program.host_block(100)});
+    f.publish(system);
+    auto head = loop_step(f, system, 150, 1);
+    for (std::uint32_t step = 2; step <= 6; ++step) {
+        head = loop_step(f, head.history, 150 + 10 * step, step);
+    }
+    std::vector<Handle> others;
+    for (int index = 0; index < 40; ++index) {
+        others.push_back(f.program.add(tokens(50, 900000 + 100 * index), {}));
+        f.publish(others.back());
+        f.use_shared(others.back());
+    }
+    const auto late = f.program.add(tokens(50, 990000), {f.program.host_block(100)});
+    f.publish(late);
+    f.use_shared(late);
+    require(*f.cache.host_victims(f.program, 100, std::nullopt) == std::vector<Handle>{system},
+            "an idle prefix kept its frequency bonus forever");
+}
+
 } // namespace
 
 int main() {
@@ -2170,6 +2230,8 @@ int main() {
         test_disk_tier_copies_demand_demoted_from_the_reuse_tier();
         test_lineage_bound_disabled_keeps_previous_behavior();
         test_lineage_capture_inherits_the_extended_points_demand();
+        test_lrfu_shared_prefix_outranks_a_newer_single_use();
+        test_lrfu_decay_lets_an_idle_prefix_age_out();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();

@@ -200,6 +200,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Private endpoints retired once their chain diverged before them.");
     COUNTER(ctx_checkpoint_boosted_captures, "ctx_checkpoint_boosted_capture_admissions_total",
             "Capture admissions that inherited the demand of the chain point they extend.");
+    COUNTER(ctx_lrfu_ancestor_references, "ctx_lrfu_ancestor_references_total",
+            "LRFU references credited to shallower public points of a resumed prefix.");
     COUNTER(speculative_rounds, "spec_decode_rounds_total",
             "Native speculative verification rounds.");
     COUNTER(speculative_draft_tokens, "spec_decode_draft_tokens_total",

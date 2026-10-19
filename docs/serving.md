@@ -911,6 +911,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--disk-context-mib N` | NVMe tier below Host: cold Host-resident checkpoints are copied to disk in the background, and a request whose deepest match is only on disk rebuilds it into Host when that beats every resident source ([Disk tier](maintainer/resource-scheduling-and-context-cache.md#disk-tier)). `0` disables the tier | `0` (off) |
 | `--disk-context-dir DIR` | directory of the tier's unnamed, preallocated file; requires `--disk-context-mib`. Use a local ext4/xfs NVMe path, not a network or Windows-mounted drive | `$XDG_CACHE_HOME/ninfer/disk-context`, else `$HOME/.cache/ninfer/disk-context` |
 | `--ctx-checkpoints N` | superseded prefix points kept per request chain before older ones are retired; `0` disables chain bounding ([CUA context checkpoints](maintainer/cua-context-checkpoints.md)) | `4` |
+| `--ctx-lrfu-lambda F` | rank retained checkpoints by LRFU (recency and frequency) with decay `F` per cache event, about ten per CUA step; a resume also counts as a reference to every shallower public point on its path, so a shared system prompt outlives single runs' history. `0` keeps LRU, at most `1` ([CUA context checkpoints](maintainer/cua-context-checkpoints.md#lrfu)) | `0` (LRU) |
 | `--ctx-checkpoint-boundaries off\|turns` | where OpenAI requests that mark no `prompt_cache_breakpoint` get checkpoints: `off` keeps the protocol's single automatic point at the end of the prompt; `turns` (agent loops) places them at the end of the first message, the first user turn and the last history turn before the final one, and drops the automatic point once a history point is placed ([CUA context checkpoints](maintainer/cua-context-checkpoints.md#boundaries)) | `turns` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -989,6 +990,7 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_captures_skipped_total` | Optional checkpoint captures dropped because no admissible space could be reclaimed |
 | `ninfer_captures_defragmented_total` | Host releases for a capture whose StateImage fit the free bytes but no single free extent |
 | `ninfer_ctx_checkpoint_retired_{public,private}_total`, `ninfer_ctx_checkpoint_boosted_capture_admissions_total` | Request-chain bounding (`--ctx-checkpoints`): retired superseded or dead chain points, and capture admissions that inherited the extended point's demand |
+| `ninfer_ctx_lrfu_ancestor_references_total` | LRFU references credited to shallower public points of a resumed prefix (`--ctx-lrfu-lambda`) |
 | `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
 | `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |

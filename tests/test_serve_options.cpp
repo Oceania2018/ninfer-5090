@@ -239,12 +239,15 @@ int main() {
                       "context-cache capacities did not reach serving options");
 
     failures += check(defaults.context_cache.ctx_checkpoints == 4 &&
+                          defaults.context_cache.ctx_lrfu_lambda == 0 &&
                           defaults.ctx_checkpoint_boundaries == CtxCheckpointBoundaries::Turns,
                       "context checkpoint defaults changed");
     const ServeOptions checkpoints =
         parse({"ninfer-serve", "model.ninfer", "--ctx-checkpoints", "0",
-               "--ctx-checkpoint-boundaries", "off"});
+               "--ctx-checkpoint-boundaries", "off", "--ctx-lrfu-lambda", "0.01"});
     failures += check(checkpoints.context_cache.ctx_checkpoints == 0 &&
+                          checkpoints.context_cache.ctx_lrfu_lambda > 0.0099 &&
+                          checkpoints.context_cache.ctx_lrfu_lambda < 0.0101 &&
                           checkpoints.ctx_checkpoint_boundaries == CtxCheckpointBoundaries::Off,
                       "context checkpoint options did not reach serving options");
     bool unknown_boundaries_rejected = false;
