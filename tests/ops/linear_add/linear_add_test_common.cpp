@@ -301,6 +301,13 @@ std::vector<float> materialize_weight_rows(const HostWeight& weight,
         weight);
 }
 
+// A query witnesses execution when they are equal. The int8-activation route sizes with one
+// 256-byte alignment allowance (q8_act_workspace_bytes) that an aligned arena never spends, so a
+// peak up to 256 bytes below the query also counts.
+bool witnesses(std::size_t peak, std::size_t query) {
+    return peak == query || (peak < query && query - peak <= 256);
+}
+
 } // namespace
 
 bool cuda_available() { return !test::cuda_unavailable(); }
@@ -329,8 +336,23 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     device_weight.copy_from_host(host_payload.data(), host_payload.size());
     const Weight weight = make_device_weight_view(host_weight, device_weight.data());
 
-    const std::size_t workspace_bytes =
+    // Graph cases below also run AllowA4 and AllowA8, which take the int8-activation route for Q5
+    // [5120,6144] from kQ4Q5Q8MinTokens tokens. Size for what each case executes: A16 over the
+    // whole interval, and the permissive query at every graph case's own T.
+    const auto runs_permissive = [&](std::int32_t t) {
+        return (t == 128 && format == WeightFormat::Q5G64F16S) ||
+               std::find(shape.graph_tokens.begin(), shape.graph_tokens.end(), t) !=
+                   shape.graph_tokens.end();
+    };
+    std::size_t workspace_bytes =
         ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
+    for (const std::int32_t t : tokens) {
+        if (runs_permissive(t)) {
+            workspace_bytes = std::max(workspace_bytes, ops::linear_add_workspace_capacity_bytes(
+                                                            qtype, shape.n, shape.k,
+                                                            ops::LinearPolicy::AllowA4, t, t));
+        }
+    }
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures              = 0;
@@ -360,13 +382,13 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                                    checked_elements(static_cast<std::int32_t>(oracle_rows.size()),
                                                     t, "reference")));
         };
+        bool permissive = false;
         try {
             ops::linear_add(input, weight, residual_out, workspace, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
             verify_result();
-            if ((t == 128 && format == WeightFormat::Q5G64F16S) ||
-                std::find(shape.graph_tokens.begin(), shape.graph_tokens.end(), t) !=
-                    shape.graph_tokens.end()) {
+            if (runs_permissive(t)) {
+                permissive = true;
                 cudaStream_t stream;
                 cudaGraph_t graph;
                 cudaGraphExec_t executable;
@@ -418,14 +440,18 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             continue;
         }
         const std::size_t exact_workspace =
-            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
-        if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
-            std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
+            permissive ? ops::linear_add_workspace_capacity_bytes(
+                             qtype, shape.n, shape.k, ops::LinearPolicy::AllowA4, t, t)
+                       : ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
+        if (workspace.used() != 0 || !witnesses(workspace.peak_used(), exact_workspace)) {
+            std::cerr << case_label << ": exact workspace query/execution high-water mismatch (used "
+                      << workspace.used() << ", peak " << workspace.peak_used() << ", query "
+                      << exact_workspace << ")\n";
             ++failures;
         }
         executed_peak = std::max(executed_peak, workspace.peak_used());
     }
-    if (executed_peak != workspace_bytes) {
+    if (!witnesses(executed_peak, workspace_bytes)) {
         std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
         ++failures;
     }
