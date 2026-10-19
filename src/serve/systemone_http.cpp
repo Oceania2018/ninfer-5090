@@ -12,6 +12,15 @@
 #include <utility>
 
 namespace ninfer::serve {
+namespace {
+
+// The System One spec's error body is a single string: {"error": "..."}.
+void write_systemone_error(httplib::Response& res, const ApiError& error) {
+    res.status = error.status;
+    res.set_content(RequestJson{{"error", error.message}}.dump(), "application/json");
+}
+
+} // namespace
 
 // Questions run one after another as ordinary Engine requests, so each is scheduled, logged and
 // cancelled like any other request; answers are independent and appear under their names.
@@ -21,7 +30,7 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
         request = parse_systemone_request(parse_json_body(req));
         validate_openai_model(request.model, public_model_id_);
     } catch (const ApiException& exception) {
-        write_openai_error(res, exception.error());
+        write_systemone_error(res, exception.error());
         return;
     }
 
@@ -55,13 +64,13 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
         } catch (const ApiException& exception) {
             record_request_rejected(make_request_rejection_log_context(
                 req_id, "systemone", question.generation, metadata, exception.error()));
-            write_openai_error(res, exception.error());
+            write_systemone_error(res, exception.error());
             return;
         } catch (const std::exception& exception) {
             const ApiError error = internal_error(exception.what());
             record_request_rejected(make_request_rejection_log_context(
                 req_id, "systemone", question.generation, metadata, error));
-            write_openai_error(res, error);
+            write_systemone_error(res, error);
             return;
         }
 
@@ -72,12 +81,12 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
             outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             lifecycle->failure(make_generation_request_failure(exception.error()));
-            write_openai_error(res, exception.error());
+            write_systemone_error(res, exception.error());
             return;
         } catch (const std::exception& exception) {
             lifecycle->failure(
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            write_openai_error(res, internal_error(exception.what()));
+            write_systemone_error(res, internal_error(exception.what()));
             return;
         }
         lifecycle->done(outcome);
@@ -86,7 +95,7 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            write_openai_error(res, internal_error(exception.what()));
+            write_systemone_error(res, internal_error(exception.what()));
             return;
         }
         input_tokens += static_cast<std::uint64_t>(outcome.prompt_tokens);

@@ -45,7 +45,7 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
-std::size_t parse_host_context_mib(const char* text) {
+std::size_t parse_context_mib(const char* text, const std::string& flag) {
     constexpr std::size_t bytes_per_mib = 1ULL << 20;
     constexpr std::size_t maximum       = std::numeric_limits<std::size_t>::max();
     const std::string_view value(text);
@@ -57,14 +57,14 @@ std::size_t parse_host_context_mib(const char* text) {
         (point != std::string_view::npos &&
          (fraction.empty() ||
           fraction.find_first_not_of("0123456789") != std::string_view::npos))) {
-        throw std::invalid_argument("--host-context-mib requires a nonnegative decimal MiB value");
+        throw std::invalid_argument(flag + " requires a nonnegative decimal MiB value");
     }
 
     std::size_t whole_mib = 0;
     for (const char character : whole) {
         const std::size_t digit = static_cast<std::size_t>(character - '0');
         if (whole_mib > (maximum / bytes_per_mib - digit) / 10) {
-            throw std::invalid_argument("--host-context-mib is out of range");
+            throw std::invalid_argument(flag + " is out of range");
         }
         whole_mib = whole_mib * 10 + digit;
     }
@@ -73,7 +73,7 @@ std::size_t parse_host_context_mib(const char* text) {
     // Use exact integer arithmetic so decimal parsing cannot round the requested budget upward.
     while (!fraction.empty() && fraction.back() == '0') { fraction.remove_suffix(1); }
     if (fraction.size() > 20) {
-        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
+        throw std::invalid_argument(flag + " must resolve to a whole number of bytes");
     }
     unsigned __int128 numerator = 0;
     unsigned __int128 divisor   = 1;
@@ -83,12 +83,12 @@ std::size_t parse_host_context_mib(const char* text) {
     }
     numerator *= bytes_per_mib;
     if (numerator % divisor != 0) {
-        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
+        throw std::invalid_argument(flag + " must resolve to a whole number of bytes");
     }
     const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
     const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
     if (fractional_bytes > maximum - whole_bytes) {
-        throw std::invalid_argument("--host-context-mib is out of range");
+        throw std::invalid_argument(flag + " is out of range");
     }
     return whole_bytes + fractional_bytes;
 }
@@ -130,6 +130,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N] [--host-state-dtype fp32|bf16|nvfp4] "
+           "[--disk-context-mib N] [--disk-context-dir DIR] "
            "[--ctx-checkpoints N] [--score-branch-rows N] "
            "[--ctx-checkpoint-boundaries off|turns] [--ctx-checkpoint-skip-media-tail on|off] "
            "[--request-log-jsonl FILE] "
@@ -166,6 +167,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --device-state-slots is extra capacity beyond active lanes; "
            "--host-context-mib bounds shared Host State/KV and in-flight storage in MiB\n"
            "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
+           "       --disk-context-mib keeps cold checkpoints on NVMe below Host instead of "
+           "deleting them (default 0 = off); --disk-context-dir defaults to "
+           "$XDG_CACHE_HOME/ninfer/disk-context\n"
            "       --host-state-dtype encodes the GDN recurrent state of Host checkpoints "
            "(default bf16; fp32 is exact, nvfp4 is the smallest); Device state stays fp32\n"
            "       --ctx-checkpoints keeps N superseded prefix points per request chain "
@@ -310,7 +314,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--host-context-mib") {
             options.context_cache.host_capacity_bytes =
-                parse_host_context_mib(require_value("--host-context-mib"));
+                parse_context_mib(require_value("--host-context-mib"), "--host-context-mib");
+        } else if (arg == "--disk-context-mib") {
+            options.context_cache.disk_capacity_bytes =
+                parse_context_mib(require_value("--disk-context-mib"), "--disk-context-mib");
+        } else if (arg == "--disk-context-dir") {
+            options.context_cache.disk_directory = require_value("--disk-context-dir");
+            if (options.context_cache.disk_directory.empty()) {
+                throw std::invalid_argument("--disk-context-dir must not be empty");
+            }
         } else if (arg == "--host-state-dtype") {
             options.context_cache.host_state_storage =
                 parse_host_state_dtype(require_value("--host-state-dtype"));
@@ -411,6 +423,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     options.context_cache.enabled = options.allow_prefix_reuse;
+    if (!options.context_cache.disk_directory.empty() &&
+        options.context_cache.disk_capacity_bytes == 0) {
+        throw std::invalid_argument("--disk-context-dir requires a positive --disk-context-mib");
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }

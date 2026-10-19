@@ -1250,6 +1250,164 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
            "retiring the final history and views leaked KV storage");
 }
 
+// The disk tier keeps a byte copy of a Host-resident history and later rebuilds Host-only pages
+// and a StateImage from it. The rebuilt objects must restore to Device bit-exactly and retire
+// without leaking descriptors or Host bytes.
+void test_disk_restore_round_trip(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 8, host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+    const std::size_t stride = host_layout.page_stride;
+
+    // Original history: 65 committed tokens on two pages, backed up to Host.
+    const auto original = addresses.create_active(2, 0, device.stream);
+    expect(original.has_value(), "disk restore source address");
+    addresses.ensure_mapped_to_tokens(*original, 65, device.stream);
+    addresses.commit_frontier(*original, 65);
+    addresses.set_checkpoint_requirement(*original, 65);
+    device.synchronize();
+    addresses.deactivate(*original);
+    const std::array original_pages{addresses.logical_page(*original, 0),
+                                    addresses.logical_page(*original, 1)};
+    auto backup = extents.prepare(pages, original_pages);
+    expect(backup.has_value(), "disk restore source Host backup");
+    physical_pages.copy_to_host(extents.device_sources(*backup), extents.writable_view(*backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const auto backup_extent = extents.publish(std::move(*backup));
+    std::vector<std::byte> saved(2 * stride);
+    std::memcpy(saved.data(), extents.view(backup_extent).data(), saved.size());
+
+    // Rebuild from the saved bytes: Host-only pages, exact coverage, one address reference.
+    const std::array restored_pages{pages.materialize_host_restore(64),
+                                    pages.materialize_host_restore(1)};
+    expect(!pages.device_resident(restored_pages[0]) && !pages.host_resident(restored_pages[0]) &&
+               pages.address_references(restored_pages[0]) == 1 &&
+               pages.writer_references(restored_pages[0]) == 0,
+           "restored page starts with one reader reference and no replica");
+    expect(!extents.prepare(pages, restored_pages),
+           "device backup preparation rejects pages without a Device replica");
+    auto restore = extents.prepare_restore(pages, restored_pages);
+    expect(restore.has_value(), "restored pages reserve a Host extent");
+    expect(!extents.prepare_restore(pages, original_pages),
+           "restore preparation rejects pages that already have replicas");
+    std::memcpy(extents.writable_view(*restore).data(), saved.data(), saved.size());
+    const auto restored_extent = extents.publish(std::move(*restore));
+    expect(pages.host_replica_current(restored_pages[0]) &&
+               pages.host_replica_current(restored_pages[1]) &&
+               pages.source_pins(restored_pages[0]) == 0,
+           "restored Host replicas are current and unpinned after publication");
+    const auto restored = addresses.create_inactive();
+    expect(restored.has_value(), "restored address allocation");
+    bool short_directory_rejected = false;
+    try {
+        addresses.install_inactive(*restored, std::span(restored_pages).first(1), 65);
+    } catch (const std::logic_error&) { short_directory_rejected = true; }
+    expect(short_directory_rejected, "restore directory must cover the committed frontier");
+    addresses.install_inactive(*restored, restored_pages, 65);
+    addresses.set_checkpoint_requirement(*restored, 65);
+    expect(addresses.mapped_pages(*restored) == 2 && addresses.committed_frontier(*restored) == 65 &&
+               addresses.logical_page(*restored, 1) == restored_pages[1] &&
+               !addresses.active(*restored),
+           "restored directory installs the exact inactive history");
+
+    // Host -> Device -> Host must reproduce the original bytes exactly.
+    auto device_reservation = physical_pages.reserve(2);
+    expect(device_reservation.has_value(), "restored pages Device reservation");
+    const std::array destinations{
+        pages.reserve_device_replica(restored_pages[0], *device_reservation),
+        pages.reserve_device_replica(restored_pages[1], *device_reservation)};
+    physical_pages.copy_from_host(extents.view(restored_extent), destinations,
+                                  device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    pages.publish_device_replica(restored_pages[0]);
+    pages.publish_device_replica(restored_pages[1]);
+    expect(extents.release(restored_extent) && !pages.host_resident(restored_pages[0]),
+           "restored pages drop their Host replica once Device holds them");
+    auto verify = extents.prepare(pages, restored_pages);
+    expect(verify.has_value(), "restored pages back up again from Device");
+    physical_pages.copy_to_host(extents.device_sources(*verify), extents.writable_view(*verify),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const auto verify_extent = extents.publish(std::move(*verify));
+    expect(std::memcmp(extents.view(verify_extent).data(), saved.data(), saved.size()) == 0,
+           "disk round trip reproduces the original page bytes exactly");
+
+    expect(addresses.release(*restored) && addresses.release(*original),
+           "restored and original histories retire independently");
+    (void)extents.release_unreferenced();
+    expect(pages.occupied() == 0 && host_arena.occupied_bytes() == 0 &&
+               host_backing.occupied_bytes() == 0,
+           "retiring restored history leaks no descriptors or Host bytes");
+
+    // StateImage: a published Host slot becomes an immutable Host-only checkpoint image.
+    q36::StateImageSpec spec{
+        .linear = {.layers         = 1,
+                   .conv_channels  = 8,
+                   .conv_width     = 3,
+                   .value_heads    = 2,
+                   .value_head_dim = 4,
+                   .key_head_dim   = 4,
+                   .slot_count     = 2,
+                   .conv_dtype     = ninfer::DType::BF16},
+        .hidden = 8,
+    };
+    ninfer::LayoutBuilder state_builder;
+    const q36::StateImageDeviceLayout state_layout =
+        q36::plan_state_image_device_pool(state_builder, spec);
+    ninfer::DeviceArena state_arena(state_builder.finish(256));
+    q36::StateImageDevicePool state_device({state_arena.base(), state_arena.capacity()},
+                                           state_layout);
+    ninfer::HostContextArena state_backing(state_layout.host.image_bytes * 2,
+                                           state_layout.host.image_bytes);
+    q36::HostStatePool state_host(state_backing, state_layout.host);
+    store::StateImageStore images(state_device, &state_host,
+                                  static_cast<std::uint32_t>(state_device.slot_count()) +
+                                      state_host.capacity());
+    const auto slot = state_host.allocate();
+    expect(slot.has_value(), "restored StateImage Host slot");
+    std::memset(state_host.writable_view(*slot).data, 0x5a, state_layout.host.image_bytes);
+    expect(state_host.publish(*slot), "restored StateImage Host slot publication");
+    const auto image = images.install_host_checkpoint(*slot);
+    expect(image && images.role(*image) == store::StateImageRole::CheckpointImmutable &&
+               images.residency(*image) == store::StateReplicaResidency::HostOnly &&
+               images.content_epoch(*image) != 0,
+           "installed StateImage is an immutable Host-only checkpoint image");
+    images.retain_checkpoint_reference(*image);
+    auto restore_state = images.begin_host_to_device(*image, device.stream);
+    expect(restore_state.has_value(), "installed StateImage restores to Device");
+    device.synchronize();
+    images.publish_transfer(std::move(*restore_state), true);
+    expect(images.residency(*image) == store::StateReplicaResidency::Both,
+           "installed StateImage gains a Device replica");
+    expect(images.release_checkpoint_owner(*image) && !images.valid(*image) &&
+               state_host.occupied() == 0 && images.device_occupied() == 0,
+           "last checkpoint owner retires the installed StateImage completely");
+}
+
 } // namespace
 
 int main() {
@@ -1269,6 +1427,7 @@ int main() {
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
+        test_disk_restore_round_trip(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

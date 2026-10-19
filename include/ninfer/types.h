@@ -153,6 +153,14 @@ struct ContextCacheOptions {
     // lies after every shared prefix point. Agent loops that rebuild the trailing screenshot turn
     // every request never resume from those points, which hold the image's KV and a StateImage.
     bool skip_media_tail = false;
+    // NVMe tier below Host. Cold complete checkpoints are written here instead of being deleted
+    // when Host runs low, and read back into Host when a request resumes from one. 0 disables
+    // the tier (the default). Content is process-private and does not survive a restart.
+    std::size_t disk_capacity_bytes = 0;
+    // Directory of the unnamed disk context file. Empty selects
+    // $XDG_CACHE_HOME/ninfer/disk-context (else $HOME/.cache/ninfer/disk-context); Engine::options()
+    // returns the resolved directory. Ignored when disk_capacity_bytes is 0.
+    std::filesystem::path disk_directory;
 };
 
 struct ContextCostOptions {
@@ -1054,6 +1062,9 @@ struct RuntimeStats {
     std::uint64_t active_captures_aborted   = 0;
     // Optional captures dropped because no admissible space could be reclaimed for them.
     std::uint64_t captures_skipped          = 0;
+    // Host releases made because free bytes sufficed for a capture's StateImage but no single
+    // free extent did.
+    std::uint64_t captures_defragmented = 0;
     // Per-chain checkpoint bounding (ContextCacheOptions::ctx_checkpoints).
     std::uint64_t ctx_checkpoint_retired_public   = 0;
     std::uint64_t ctx_checkpoint_retired_private  = 0;
@@ -1113,7 +1124,28 @@ struct RuntimeStats {
     std::size_t host_context_reserved_bytes = 0;
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
+    // Largest single free Host extent and the number of free extents.
+    std::size_t host_context_largest_free_bytes = 0;
+    std::size_t host_context_free_extents       = 0;
     double actual_context_transfer_seconds       = 0.0;
+    // Disk tier (all zero when disabled). Occupied bytes include an in-flight write.
+    std::size_t disk_context_occupied_bytes        = 0;
+    std::size_t disk_context_capacity_bytes        = 0;
+    std::uint32_t disk_context_records             = 0;
+    std::uint64_t disk_context_writes              = 0;
+    std::uint64_t disk_context_write_bytes         = 0;
+    std::uint64_t disk_context_writes_discarded    = 0;
+    std::uint64_t disk_context_restores            = 0;
+    std::uint64_t disk_context_restore_bytes       = 0;
+    std::uint64_t disk_context_evictions           = 0;
+    std::uint64_t disk_context_io_errors           = 0;
+    // Admission evaluations whose deepest disk match was not restored, by first reason: a resident
+    // source already reached as deep, another restore or context transaction was in flight,
+    // recomputing was priced cheaper, or Host room could not be made.
+    std::uint64_t disk_context_restores_declined_resident = 0;
+    std::uint64_t disk_context_restores_declined_busy     = 0;
+    std::uint64_t disk_context_restores_declined_cost     = 0;
+    std::uint64_t disk_context_restores_declined_host     = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

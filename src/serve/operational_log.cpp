@@ -466,6 +466,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(*cache.host_capacity_bytes),
                   host_state_name(cache.host_state_storage),
                   cache.skip_media_tail ? " | media tail skipped" : "");
+    if (cache.disk_capacity_bytes != 0) {
+        logger_->info("context | disk tier {} at {}",
+                      product::format_pretty_bytes(cache.disk_capacity_bytes),
+                      cache.disk_directory.string());
+    }
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();

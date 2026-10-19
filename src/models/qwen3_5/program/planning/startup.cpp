@@ -9,6 +9,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
+#include "core/disk_context_store.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -913,6 +914,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         checked_mul(8, impl->persistent.state_images.host.image_bytes,
                                     "Host context state default overflow"),
                         "Host context default overflow");
+    }
+    if (impl->context_cache.disk_capacity_bytes != 0 && impl->context_cache.disk_directory.empty()) {
+        impl->context_cache.disk_directory = default_disk_context_directory();
     }
     impl->workspace = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {

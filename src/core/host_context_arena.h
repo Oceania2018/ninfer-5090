@@ -47,6 +47,11 @@ private:
     bool reserved_           = false;
 };
 
+// Where an allocation is carved from. StateImages all share one size and take High, from the
+// top of the backing; KV runs vary in size and take Low. Keeping the two apart lets a released
+// image leave a hole another image fits, instead of a gap scattered between KV runs.
+enum class HostPlacement : std::uint8_t { Low, High };
+
 // One startup-fixed pinned backing shared by every optional Host context representation.
 // minimum_allocation_bytes is the smallest supported complete geometry, not a quota split.
 // It bounds metadata at startup; all allocations and split pieces must meet that minimum.
@@ -81,8 +86,14 @@ public:
 
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
+    // Free bytes can exceed the largest single allocation that still fits.
+    [[nodiscard]] std::size_t largest_free_bytes() const noexcept;
+
+    [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
+
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
-    [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
+    [[nodiscard]] std::optional<HostContextAllocation>
+    allocate(std::size_t bytes, HostPlacement placement = HostPlacement::Low) noexcept;
     [[nodiscard]] std::pair<HostContextAllocation, HostContextAllocation>
     split(HostContextAllocation&& allocation, std::size_t byte_offset);
 
@@ -95,7 +106,8 @@ private:
     };
 
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
-    [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
+    [[nodiscard]] std::optional<std::size_t>
+    find_free_extent(std::size_t bytes, HostPlacement placement = HostPlacement::Low) const noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
 

@@ -90,6 +90,37 @@ void test_fragmentation_and_split() {
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
 }
+// Images take the top and KV the bottom, so a released image leaves a hole the next image fits
+// even while KV runs come and go between them.
+void test_high_placement_keeps_images_apart_from_kv() {
+    using ninfer::HostPlacement;
+    ninfer::HostContextArena arena(4096, 256);
+    auto image_a = arena.allocate(1024, HostPlacement::High);
+    auto kv_a    = arena.allocate(256);
+    auto image_b = arena.allocate(1024, HostPlacement::High);
+    auto kv_b    = arena.allocate(512);
+    expect(image_a && kv_a && image_b && kv_b, "mixed placements fit the backing");
+    const auto* base = kv_a->data();
+    expect(image_a->data() == base + 3072 && image_b->data() == base + 2048 &&
+               kv_b->data() == base + 256,
+           "images fill from the top and KV from the bottom");
+    expect(arena.largest_free_bytes() == 1280 && arena.free_extent_count() == 1,
+           "the free middle stays one extent");
+    (void)kv_a->release();
+    (void)image_a->release();
+    expect(arena.free_extent_count() == 3 && arena.largest_free_bytes() == 1280,
+           "released image and KV leave separate holes");
+    auto kv_c = arena.allocate(256);
+    expect(kv_c && kv_c->data() == base, "KV reuses the low hole first");
+    auto image_c = arena.allocate(1024, HostPlacement::High);
+    expect(image_c && image_c->data() == base + 3072,
+           "the next image takes the released image's exact hole");
+    auto image_d = arena.allocate(1024, HostPlacement::High);
+    expect(image_d && image_d->data() == base + 1024 && arena.largest_free_bytes() == 256,
+           "a full top falls back to the highest fitting extent");
+    expect(!arena.allocate(1024, HostPlacement::High) && arena.free_bytes() == 256,
+           "High placement still requires one contiguous extent");
+}
 } // namespace
 
 int main() {
@@ -103,6 +134,7 @@ int main() {
     try {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
+        test_high_placement_keeps_images_apart_from_kv();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
