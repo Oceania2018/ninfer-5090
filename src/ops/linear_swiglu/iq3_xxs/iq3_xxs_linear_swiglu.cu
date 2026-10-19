@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/iq3_xxs/iq3_xxs_linear_swiglu.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "ops/common/device_class.h"
 #include "ops/common/iq3xxs_matmul.cuh"
 
 #include <cuda_bf16.h>
@@ -68,7 +69,15 @@ void iq3_xxs_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& ou
         launch_direct<2, 1, 4>(xp, codes, d, tokens, o, stream);
     }
 #else
-    if (tokens <= 8) {
+    // Small-SM cards (RTX 5060 Ti, 36 SMs, ~448 GB/s): a one-warp CTA keeps too few loads in
+    // flight, so split K across two warps. Measured with weights streamed from DRAM:
+    // T=1 197.0 -> 177.9 us, T=8 199.4 -> 177.7 us (342 -> 384 GB/s), T=16 254.1 -> 213.0 us.
+    const bool small_sm = small_sm_device();
+    if (small_sm && tokens <= 8) {
+        launch_direct<2, 1, 1>(xp, codes, d, tokens, o, stream);
+    } else if (small_sm && tokens <= 16) {
+        launch_direct<2, 2, 2>(xp, codes, d, tokens, o, stream);
+    } else if (tokens <= 8) {
         launch_direct<1, 2, 1>(xp, codes, d, tokens, o, stream);
     } else if (tokens <= 16) {
         launch_direct<1, 2, 2>(xp, codes, d, tokens, o, stream);

@@ -10,6 +10,8 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q5/q5_sliced_k_launch.cuh"
+#include "ops/common/device_class.h"
 
 #include <cuda_bf16.h>
 
@@ -181,6 +183,36 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
     }
 }
 
+template <std::int32_t Capacity>
+void launch_q5_sliced_exact(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                            cudaStream_t stream) {
+    using Schedule = Q5A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 4, 2, Cache::cg,
+                                             Cache::ca, 6, kHidden, Capacity>;
+    launch_q5_a16_sliced_k_mma<Schedule>(q5_linear_operands(x, weight),
+                                         q5_projection_output(gate, value),
+                                         LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q5_sliced_band(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                           cudaStream_t stream) {
+    switch (x.ne[1]) {
+    case 7:
+        launch_q5_sliced_exact<7>(x, weight, gate, value, stream);
+        return;
+    case 8:
+        launch_q5_sliced_exact<8>(x, weight, gate, value, stream);
+        return;
+    case 9:
+        launch_q5_sliced_exact<9>(x, weight, gate, value, stream);
+        return;
+    case 10:
+        launch_q5_sliced_exact<10>(x, weight, gate, value, stream);
+        return;
+    default:
+        throw std::invalid_argument("attention Q5 sliced-K band requires T in [7,10]");
+    }
+}
+
 template <int ColsPerTile>
 void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                     cudaStream_t stream) {
@@ -193,6 +225,12 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
                cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, gate, value, stream);
+        return;
+    }
+    if (x.ne[1] >= 7 && x.ne[1] <= 10 && small_sm_device()) {
+        // Small-SM cards (RTX 5060 Ti, 36 SMs): split4 SIMT is issue-bound at T=7..10; the
+        // tensor-core sliced-K route (4 K-warps, 2 stages) is the GDN parent's measured choice.
+        launch_q5_sliced_band(x, weight, gate, value, stream);
         return;
     }
     if (x.ne[1] <= 9) {
