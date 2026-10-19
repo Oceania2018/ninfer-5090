@@ -175,7 +175,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --ctx-checkpoints keeps N superseded prefix points per request chain "
            "(default 4, 0 disables)\n"
            "       --ctx-lrfu-lambda ranks retained checkpoints by LRFU with this decay per cache "
-           "event (default 0 = LRU, at most 1)\n"
+           "event (default 0.01, 0 = LRU, at most 1)\n"
            "       --score-branch-rows sets branches per /v1/systemone rank pass (0 disables "
            "rank, at most 256, default 100); each row keeps about one KV page\n"
            "       --ctx-checkpoint-boundaries turns checkpoints the first message, the first "

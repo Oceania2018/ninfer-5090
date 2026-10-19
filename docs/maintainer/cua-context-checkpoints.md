@@ -104,7 +104,7 @@ Implementation: `note_lineage`, `supersede`, `retire_dead_siblings` and `retire_
 <a id="lrfu"></a>
 ### 4.1 LRFU ranking
 
-`--ctx-lrfu-lambda F` (default `0`, LRU) ranks retained points by LRFU (Lee et al., 2001) instead
+`--ctx-lrfu-lambda F` (default `0.01`; `0` restores LRU) ranks retained points by LRFU (Lee et al., 2001) instead
 of their last reference alone, and changes what counts as a reference:
 
 | Rule | Effect |

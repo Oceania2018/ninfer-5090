@@ -146,10 +146,11 @@ struct ContextCacheOptions {
     // (0 disables chain bounding). A chain is the run of public points each resumed from the
     // previous one exactly once, as an agent loop that replaces its last turn produces.
     std::uint32_t ctx_checkpoints = 4;
-    // LRFU decay per cache event for retained checkpoint ranking (0 keeps LRU). A resume also
-    // counts as a reference to every shallower public point on its path, so a shared system
-    // prompt that every run passes through outranks any single run's history.
-    double ctx_lrfu_lambda = 0;
+    // LRFU decay per cache event for retained checkpoint ranking (0 restores LRU). A resume
+    // also counts as a reference to every shallower public point on its path, so a shared system
+    // prompt that every run passes through outranks any single run's history. 0.01 is about ten
+    // CUA steps' half-life (2026-10-19 CUA stress on a full 48 GiB Host pool: no cold first step).
+    double ctx_lrfu_lambda = 0.01;
     // Host StateImage encoding of the GDN recurrent state. FP32 is exact; BF16 and NVFP4 round
     // once per Host backup in exchange for proportionally more Host checkpoints per byte.
     HostStateStorage host_state_storage = HostStateStorage::BFloat16;
