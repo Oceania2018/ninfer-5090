@@ -6,6 +6,11 @@
 namespace ninfer::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 192;
+// The tiled kernel runs one 64-row query tile per CTA (one CTA per SM). On 170 SMs a short prefill
+// leaves most of the GPU idle, so widths up to kGroupedPrefillMaxWidth split the keys instead. With
+// <= 48 SMs (RTX 5060 Ti: 36) three query tiles x 24 heads already fill two waves, and the split
+// partials cost more than they recover: CUA step prefill at a 16.6K-token context 1313 -> 1280 ms.
+constexpr int kSmallGpuMaxSms = 48;
 } // namespace
 
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
@@ -17,9 +22,11 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("NVFP4 attention: invalid plan inputs");
     constexpr int grouped_limit = Nvfp4KvCausalPlan::kTokenTile;
-    const auto family           = width <= grouped_limit ? Nvfp4KvFamily::Grouped
-                                  : width <= kGroupedPrefillMaxWidth ? Nvfp4KvFamily::ParallelGrouped
-                                                                     : Nvfp4KvFamily::Tiled;
+    const bool tiled_prefill = batch == 1 && multiprocessor_count <= kSmallGpuMaxSms;
+    const auto family        = width <= grouped_limit ? Nvfp4KvFamily::Grouped
+                               : width <= kGroupedPrefillMaxWidth && !tiled_prefill
+                                   ? Nvfp4KvFamily::ParallelGrouped
+                                   : Nvfp4KvFamily::Tiled;
     const int tiles =
         family == Nvfp4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;

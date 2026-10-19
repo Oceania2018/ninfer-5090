@@ -18,6 +18,7 @@
 // registers one 256-value stage ahead, the token tile's activations are shared through a 2-stage
 // cp.async ring. grid = (ceil(T / (8*NT)), sum_j n_j / BM); every job's n must divide by BM.
 
+#include "ops/common/device_class.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/q8_act.cuh"
@@ -302,11 +303,12 @@ inline RowSplitGroupedMmaJob rowsplit_q8_job(const Weight& weight, std::int32_t 
     };
 }
 
-// MT=1, NT=8, 4 warps (64 rows x 64 tokens), three CTAs per SM.
+// MT=1, NT=8, 4 warps (64 rows x 64 tokens), three CTAs per SM. Small-SM cards (36-SM RTX 5060 Ti)
+// run two: whole-model prefill pp163 1091 -> 1106 tok/s, pp1024 1546 -> 1581 tok/s.
 template <int K, int Jobs, RowSplitGroupedMmaCodec Codec, RowSplitQ8Output Output>
 void rowsplit_q8_launch(const Q8Act& act, const RowSplitGroupedMmaJob (&jobs)[4], int tokens,
                         cudaStream_t stream) {
-    constexpr int MT = 1, NT = 8, WM = 4, MB = 3;
+    constexpr int MT = 1, NT = 8, WM = 4;
     constexpr int BM = 16 * MT * WM, BN = 8 * NT;
     int tiles = 0;
     for (int j = 0; j < Jobs; ++j) {
@@ -316,8 +318,13 @@ void rowsplit_q8_launch(const Q8Act& act, const RowSplitGroupedMmaJob (&jobs)[4]
         tiles += jobs[j].n / BM;
     }
     const dim3 grid(static_cast<unsigned>((tokens + BN - 1) / BN), static_cast<unsigned>(tiles));
-    rowsplit_q8_mma_kernel<K, MT, NT, WM, MB, Jobs, Codec, Output><<<grid, WM * 32, 0, stream>>>(
-        act.xq, act.sx, act.sx_stride, jobs[0], jobs[1], jobs[2], jobs[3], tokens);
+    if (small_sm_device()) {
+        rowsplit_q8_mma_kernel<K, MT, NT, WM, 2, Jobs, Codec, Output><<<grid, WM * 32, 0, stream>>>(
+            act.xq, act.sx, act.sx_stride, jobs[0], jobs[1], jobs[2], jobs[3], tokens);
+    } else {
+        rowsplit_q8_mma_kernel<K, MT, NT, WM, 3, Jobs, Codec, Output><<<grid, WM * 32, 0, stream>>>(
+            act.xq, act.sx, act.sx_stride, jobs[0], jobs[1], jobs[2], jobs[3], tokens);
+    }
 }
 
 } // namespace ninfer::ops::detail

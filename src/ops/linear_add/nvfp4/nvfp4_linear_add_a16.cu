@@ -1,4 +1,5 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "ops/common/device_class.h"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
@@ -52,6 +53,21 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
             launch_nvfp4_a16_mma<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>, 6144>>(
                 p, output, epilogue, stream);
+            return;
+        }
+        // Small-SM cards (36-SM RTX 5060 Ti): 64-token tiles, four CTAs per SM. A 128-token tile
+        // pads a CUA step's 163-token tail chunk to 256 and leaves 160 CTAs (~2 waves).
+        // Measured T=163 473 -> 342 us, T=256 476 -> 391 us, T=1024 1574 -> 1486 us.
+        if (small_sm_device()) {
+            if (tokens <= 192) {
+                launch_nvfp4_a16_mma<
+                    Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 64, 32, 16, 2, 4>, 6144>>(
+                    p, output, epilogue, stream);
+            } else {
+                launch_nvfp4_a16_mma<
+                    Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 64, 64, 16, 2, 4>, 6144>>(
+                    p, output, epilogue, stream);
+            }
             return;
         }
         {
