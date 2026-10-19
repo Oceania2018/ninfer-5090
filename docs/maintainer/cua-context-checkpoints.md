@@ -94,6 +94,7 @@ public entries in `ResourceManager`:
 | Dead points | Unadopted points of the same chain that are deeper than where this request resumed, published by an earlier step, are retired (for example the previous screenshot-end marker). Shallower ones are kept: a session recap ahead of the task can still serve the next task. |
 | Private endpoints | When a request resumes from P, the private points of P's publisher beyond the divergence (E, input point) are retired. |
 | Admission | A non-input capture that extends a non-root adopted point inherits that point's demand instead of the one-step coverage budget. The input capture at the end of the prompt, the turn the next step replaces, does not. |
+| Lossless moves | A capture with repeat demand may move a hotter point from Device to Host (a demotion keeps it intact); heat only picks the coldest such point. Host deletions still need the capture to outrank the victim. Without this, four or five concurrent runs on three Device state slots locked a run that started after them out of its own history: every step resumed from the system prompt. |
 
 Implementation: `note_lineage`, `supersede`, `retire_dead_siblings` and `retire_shared` in
 [`resource_manager.h`](../../src/runtime/engine/context_cache/resource_manager.h); unit tests

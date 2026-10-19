@@ -1627,8 +1627,15 @@ private:
         if (!preserving && !may_revoke(removed, cursor.rights)) { return false; }
         if (!admission) { return true; }
         const auto victim = facts.priority;
-        if (victim.reused && (!admission->priority.reused ||
-                              victim.last_demand >= admission->priority.last_demand)) {
+        // A demotion moves its sources to Host intact; the Host victims it needs are admitted
+        // against this same admission separately. For a write with repeat demand, the sources'
+        // heat therefore only orders the choice (coldest first) and cannot veto it. Otherwise
+        // agent runs that keep every Device slot hot lock a run that started after them out of
+        // its own history: each of its steps resumes from the system prompt again.
+        const bool lossless_for_demand = preserving && admission->demand.reused;
+        if (!lossless_for_demand && victim.reused &&
+            (!admission->priority.reused ||
+             victim.last_demand >= admission->priority.last_demand)) {
             return false;
         }
         const auto loss = preserving ? 0 : action_loss(program, removed, facts, evaluation);

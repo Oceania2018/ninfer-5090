@@ -2217,6 +2217,66 @@ void test_lrfu_decay_lets_an_idle_prefix_age_out() {
             "an idle prefix kept its frequency bonus forever");
 }
 
+// Production CUA stress (2026-10-19): with four or five agent runs on three Device state slots, a
+// run that started while the others held every slot never got its own history point. Its capture
+// could only make room by moving another run's hot head to Host, and the heat comparison refused
+// even that move, so every later step resumed from the system prompt again.
+ninfer::runtime::ReclaimProgress capture_room_among_hot_runs(double lambda, bool second_step) {
+    Fixture f(1 << 20, 4, lambda);
+    const auto system = f.program.add(tokens(100));
+    f.publish(system);
+    std::vector<LoopStep> heads;
+    for (std::uint32_t run = 0; run < 3; ++run) {
+        heads.push_back(loop_step(f, system, 150, 10 * run + 1));
+    }
+    // Only the heads hold the three Device slots; everything else is already Host-only.
+    const auto only_heads_on_device = [&] {
+        for (auto& content : f.program.contents) { content.device_state = false; }
+        for (const auto& head : heads) {
+            f.program.contents[head.history.index].device_state   = true;
+            f.program.contents[head.history.index].demotion_bytes = 8;
+        }
+    };
+    const auto step_others = [&](std::uint32_t step) {
+        for (std::uint32_t run = 0; run < 3; ++run) {
+            heads[run] = loop_step(f, heads[run].history, 150 + 10 * step, 10 * run + step);
+        }
+        only_heads_on_device();
+    };
+    step_others(2);
+    const Key task = concat(tokens(100), tokens(30, 7000000));
+    const auto request = [&](std::uint32_t step) {
+        return Base{.tokens = concat(task, tokens(20 * step, 7100000)), .captures = {130}};
+    };
+    const auto first = request(1);
+    const auto owner = f.begin(first, system);
+    f.cache.observe_committed(first, 501, 0, static_cast<std::uint32_t>(first.tokens.size()));
+    auto admission = f.cache.capture_admission(f.program, owner, first, 130, false, false, 501);
+    if (second_step) {
+        // The first step's capture found no room; it ends, the other runs move on, and the next
+        // step resumes from the system prompt again and crosses the same task prefix.
+        f.cache.finish(f.program, owner, first, f.next_order);
+        step_others(3);
+        const auto second = request(2);
+        const auto next   = f.begin(second, system);
+        f.cache.observe_committed(second, 502, 0, static_cast<std::uint32_t>(second.tokens.size()));
+        admission = f.cache.capture_admission(f.program, next, second, 130, false, false, 502);
+        require(admission.demand.reused, "the second crossing of the task prefix carried no demand");
+    }
+    auto cursor = f.cache.begin_reclaim(f.program, admission);
+    return f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor);
+}
+
+void test_capture_with_repeat_demand_moves_hotter_device_history_to_host() {
+    using ninfer::runtime::ReclaimProgress;
+    for (const double lambda : {0.0, 0.01}) {
+        require(capture_room_among_hot_runs(lambda, false) == ReclaimProgress::Blocked,
+                "a first-crossing capture moved another run's hot head");
+        require(capture_room_among_hot_runs(lambda, true) == ReclaimProgress::Changed,
+                "a capture with repeat demand could not move a hotter head to Host");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2232,6 +2292,7 @@ int main() {
         test_lineage_capture_inherits_the_extended_points_demand();
         test_lrfu_shared_prefix_outranks_a_newer_single_use();
         test_lrfu_decay_lets_an_idle_prefix_age_out();
+        test_capture_with_repeat_demand_moves_hotter_device_history_to_host();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_adjacent_kv_demotions_share_one_submission();
         test_kv_demotion_batch_stops_at_an_intervening_delete();
