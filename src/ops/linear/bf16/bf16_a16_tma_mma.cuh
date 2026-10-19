@@ -64,7 +64,7 @@ template <class Schedule>
 __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorMap* map,
                                               int k_sector, int row, std::uint64_t* barrier) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-    // Fork-local: TMA needs sm_90. sm_89 builds route BF16 TMA schedules to the MMA kernel.
+    // sm_89 build: TMA needs sm_90. sm_89 builds route BF16 TMA schedules to the MMA kernel.
     __trap();
 #else
     if constexpr (bf16_predicated_k<Schedule>) {
@@ -153,7 +153,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
 }
 
 #if defined(NINFER_SM86)
-// Fork-local (rtx4090-port): sm_89 has no TMA. A TMA schedule keeps its tile geometry and runs on
+// sm_89 build: sm_89 has no TMA. A TMA schedule keeps its tile geometry and runs on
 // the cp.async MMA kernel: no producer warp, no barrier storage, the cp.async swizzle.
 template <class Schedule>
 struct Bf16TmaOnCpAsync : Schedule {

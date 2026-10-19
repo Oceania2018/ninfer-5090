@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 
-# CUDA 13.1 is the validated sm_120a toolkit (RTX 5060 Ti / 5090).
+# CUDA 13.1 is the validated toolkit for every target; the host driver must support CUDA 13.1.
+# CUDA_ARCH selects the build (see CMakeLists.txt): 120a for RTX 5090 / 5060 Ti (default), 89 for
+# RTX 4090:
+#   docker build --build-arg CUDA_ARCH=89 .
 FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -22,9 +25,11 @@ COPY . .
 # Heavy nvcc translation units take 1-2 GB each; an unbounded --parallel on a many-core,
 # modest-RAM host OOMs the build. Override with --build-arg BUILD_JOBS=N.
 ARG BUILD_JOBS=8
+ARG CUDA_ARCH=120a
 
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \

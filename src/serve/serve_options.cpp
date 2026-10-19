@@ -332,7 +332,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_state_storage =
                 parse_host_state_dtype(require_value("--host-state-dtype"));
 #if defined(NINFER_SM86)
-            // Fork-local (sm_89): NVFP4 StateImages pack E2M1 (cvt.e2m1x2, sm_100a+), which traps
+            // sm_89 build: NVFP4 StateImages pack E2M1 (cvt.e2m1x2, sm_100a+), which traps
             // at the first Host backup on this build. Refuse it here instead of mid-serving.
             if (options.context_cache.host_state_storage == HostStateStorage::Nvfp4Group16) {
                 throw std::invalid_argument(

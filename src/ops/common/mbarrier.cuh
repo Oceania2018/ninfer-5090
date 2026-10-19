@@ -6,7 +6,7 @@
 
 namespace ninfer::ops {
 
-// Fork-local (rtx4090-port): mbarrier transactions and their fences need sm_90. An sm_89 build
+// sm_89 build: mbarrier transactions and their fences need sm_90. An sm_89 build
 // still compiles every caller, but these bodies trap there. Host code keeps sm_89 off the TMA
 // paths (catch-up #4 stage 1, docs/maintainer/port-ledger.md).
 

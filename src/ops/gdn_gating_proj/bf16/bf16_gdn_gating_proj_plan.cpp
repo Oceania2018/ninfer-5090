@@ -27,6 +27,7 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
+#if defined(NINFER_SM86)
 constexpr std::array<RouteSpec, 5> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
@@ -41,6 +42,18 @@ constexpr std::array<RouteSpec, 5> k27Routes{{
     {{1281, 2688}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{2689, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#else
+constexpr std::array<RouteSpec, 6> k27Routes{{
+    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    // RTX 5090/170-SM performance policy: as token tiles double, halve SplitK to keep the preferred
+    // full grid near 192 CTAs. The launcher independently enforces actual-device residency.
+    {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+#endif
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
     // Same progression. Grid is ceil(T/64)*2*SplitK; the sm_89 budgets (512 CTAs for split16,
@@ -67,6 +80,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
+#if defined(NINFER_SM86)
 // Device-wide resident-CTA budgets for the sm_89 build: the per-SM occupancy measured on sm_86
 // carries over unchanged (identical register counts and per-SM limits), scaled from 82 to the
 // RTX 4090's 128 SMs. These are the single source of truth: both the runtime residency
@@ -122,6 +136,7 @@ static_assert(catalog_is_resident(k27Routes, 128, 3, resident_ctas_27),
               "a 27B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
 static_assert(catalog_is_resident(k35Routes, 64, 2, resident_ctas_35),
               "a 35B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
+#endif
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;

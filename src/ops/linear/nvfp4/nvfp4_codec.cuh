@@ -74,7 +74,7 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
-    // Fork-local: cvt.e2m1x2.f32 needs sm_100a or later. sm_89 refuses NVFP4 and K8V4 KV at
+    // sm_89 build: cvt.e2m1x2.f32 needs sm_100a or later. sm_89 refuses NVFP4 and K8V4 KV at
     // startup and binds NVFP4 weights as A16, so no sm_89 path packs E2M1.
     (void)values;
     codes_lo = 0;

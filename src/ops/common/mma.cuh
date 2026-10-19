@@ -86,7 +86,7 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(kUnitScale8), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
 #else
-    // Fork-local: the .kind:: block-scale form needs sm_120a. sm_89 assembles the plain e4m3
+    // sm_89 build: the .kind:: block-scale form needs sm_120a. sm_89 assembles the plain e4m3
     // form, which equals the unit-scale (UE8M0 0x7f) result above.
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -115,7 +115,7 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                                                unsigned b0, unsigned b1, unsigned sfa,
                                                unsigned sfb) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
-    // Fork-local: E2M1 block-scale MMA needs sm_120a. sm_89 binds NVFP4 weights as A16.
+    // sm_89 build: E2M1 block-scale MMA needs sm_120a. sm_89 binds NVFP4 weights as A16.
     (void)c0, (void)c1, (void)c2, (void)c3, (void)a0, (void)a1, (void)a2, (void)a3;
     (void)b0, (void)b1, (void)sfa, (void)sfb;
     __trap();

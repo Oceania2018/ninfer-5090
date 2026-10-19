@@ -3,7 +3,7 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
+single NVIDIA GeForce RTX 5090, RTX 5060 Ti or RTX 4090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
 resident model, and one to eight execution lanes fixed at startup.
 
@@ -28,11 +28,17 @@ the weights again.
 
 ## Quick start
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
+NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, RTX 5060 Ti or RTX 4090, a CUDA toolkit
+supporting the card's architecture,
 CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+CUDA 13.1 is the validated development toolkit for every card, and the host driver must support it;
+CMake does not impose a CUDA version floor.
+Each build targets one architecture through `CMAKE_CUDA_ARCHITECTURES`: `120a` (default) for the
+RTX 5090 and RTX 5060 Ti, or `89` for the RTX 4090. Cards with at most 48 SMs (RTX 5060 Ti) select
+their launch shapes at runtime. The `89` build has no FP8/NVFP4 activation routes and refuses NVFP4
+and K8V4 KV storage and NVFP4 Host StateImages; startup rejects a card that does not match the build.
+The Docker image takes the same choice as `--build-arg CUDA_ARCH=89`.
 
 Build the product binaries:
 

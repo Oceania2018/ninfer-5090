@@ -58,7 +58,7 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
             result.policy = ops::LinearPolicy::A16Only;
             break;
 #if defined(NINFER_SM86)
-        // Fork-local (rtx4090-port): the FP8 A8 and NVFP4 A4 routes load through TMA or use E2M1
+        // sm_89 build: the FP8 A8 and NVFP4 A4 routes load through TMA or use E2M1
         // block-scale MMA, which sm_89 lacks, so those weights run their A16 routes. The IQ3_XXS
         // and Q4/Q5 group-64 A8 routes quantize activations to int8 and contract with
         // mma.m16n8k32.s8 over cp.async (sm_80+), so they run as AllowA8 for prefill. AllowA4

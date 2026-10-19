@@ -132,7 +132,7 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                                                   std::int32_t coordinate1,
                                                   std::uint64_t* barrier) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-    // Fork-local: TMA needs sm_90. sm_89 builds bind NVFP4 weights as A16 and never launch A4.
+    // sm_89 build: TMA needs sm_90. sm_89 builds bind NVFP4 weights as A16 and never launch A4.
     __trap();
 #else
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "

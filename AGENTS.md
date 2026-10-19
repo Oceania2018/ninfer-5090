@@ -3,7 +3,9 @@
 ## Product and architecture
 
 NInfer is a C++/CUDA inference engine for maximum single-GPU performance, targeting `sm_120a`
-on NVIDIA GeForce RTX 5090. Choose designs for functional and numerical correctness, clear
+on NVIDIA GeForce RTX 5090 and RTX 5060 Ti (small-SM shapes chosen at runtime) and `sm_89` on
+RTX 4090 (`CMAKE_CUDA_ARCHITECTURES=89`, `NINFER_SM86`). All three build from master; do not
+reintroduce per-card branches. Choose designs for functional and numerical correctness, clear
 ownership, and the performance goal within the requested scope.
 
 It implements `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`. Checkpoints and recipe combinations

@@ -120,7 +120,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
 
     if (tid < Schedule::kProducerThreads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-        // Fork-local: setmaxnreg and mbarrier need sm_90. sm_89 refuses NVFP4 KV at startup.
+        // sm_89 build: setmaxnreg and mbarrier need sm_90. sm_89 refuses NVFP4 KV at startup.
         __trap();
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;"

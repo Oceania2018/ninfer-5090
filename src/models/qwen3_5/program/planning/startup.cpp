@@ -863,9 +863,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         break;
     }
 #if defined(NINFER_SM86)
-    // Fork-local (rtx4090-port): the build targets sm_89 only.
+    // sm_89 build (CMAKE_CUDA_ARCHITECTURES=89): the binary runs on compute capability 8.9 only.
     if (device.compute_capability() != 89) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 8.9");
+        throw std::invalid_argument(
+            "this build targets sm_89 (compute capability 8.9); rebuild with "
+            "CMAKE_CUDA_ARCHITECTURES=120a for compute capability 12.0");
     }
     // The NVFP4-valued KV modes pack E2M1 (cvt.e2m1x2, sm_100a+) and their attention uses TMA
     // and setmaxnreg (sm_90). Those device bodies trap on sm_89, so refuse the modes here.
@@ -876,7 +878,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
 #else
     if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
+        throw std::invalid_argument(
+            "this build targets sm_120a (compute capability 12.0); rebuild with "
+            "CMAKE_CUDA_ARCHITECTURES=89 for compute capability 8.9");
     }
 #endif
 }
