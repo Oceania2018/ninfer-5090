@@ -1435,6 +1435,26 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
             "publishing the newly learned Shared point lost its actual demand evidence");
 }
 
+// An agent task's next step decides its capture before its own commit is observed. The previous
+// step's crossing of the same prefix already makes this the second request there.
+void test_capture_by_a_second_request_counts_as_demand() {
+    Fixture f(0);
+    const Base incoming{.tokens = tokens(3, 1000), .captures = {2}};
+    f.cache.observe_committed(incoming, 7, 0, 3);
+    require(!f.cache.capture_admission(f.program, 0, incoming, 2, false).priority.reused,
+            "a capture without its request id borrowed the first crossing");
+    require(!f.cache.capture_admission(f.program, 0, incoming, 2, false, false, 7)
+                 .priority.reused,
+            "the request that crossed first counted its own crossing as demand");
+    require(f.cache.capture_admission(f.program, 0, incoming, 2, false, false, 8)
+                .priority.reused,
+            "a second request capturing a crossed prefix carried no demand");
+    const Base unrelated{.tokens = tokens(3, 5000), .captures = {2}};
+    require(!f.cache.capture_admission(f.program, 0, unrelated, 2, false, false, 8)
+                 .priority.reused,
+            "an uncrossed prefix carried demand");
+}
+
 void test_optional_capture_budget_spans_host_and_device_actions() {
     Fixture f(64);
     const auto host = f.program.add(tokens(60, 1000), {f.program.host_block(64)});
@@ -2173,6 +2193,7 @@ int main() {
         test_optional_capture_does_not_inherit_required_eviction_rights();
         test_physical_host_alias_uses_all_holders_priority();
         test_committed_repeated_demand_admits_a_new_short_working_set();
+        test_capture_by_a_second_request_counts_as_demand();
         test_cold_writeback_protects_reused_history();
         test_host_preflight_counts_aliases_and_has_no_partial_deletion();
         test_candidates_keep_all_frontiers_and_independent_contents();

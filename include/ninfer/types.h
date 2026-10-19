@@ -1062,6 +1062,9 @@ struct RuntimeStats {
     std::uint64_t active_captures_aborted   = 0;
     // Optional captures dropped because no admissible space could be reclaimed for them.
     std::uint64_t captures_skipped          = 0;
+    // Host releases made because free bytes sufficed for a capture's StateImage but no single
+    // free extent did.
+    std::uint64_t captures_defragmented = 0;
     // Per-chain checkpoint bounding (ContextCacheOptions::ctx_checkpoints).
     std::uint64_t ctx_checkpoint_retired_public   = 0;
     std::uint64_t ctx_checkpoint_retired_private  = 0;
@@ -1121,6 +1124,9 @@ struct RuntimeStats {
     std::size_t host_context_reserved_bytes = 0;
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
+    // Largest single free Host extent and the number of free extents.
+    std::size_t host_context_largest_free_bytes = 0;
+    std::size_t host_context_free_extents       = 0;
     double actual_context_transfer_seconds       = 0.0;
     // Disk tier (all zero when disabled). Occupied bytes include an in-flight write.
     std::size_t disk_context_occupied_bytes        = 0;

@@ -192,6 +192,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Initial bindings with checkpoint reuse.");
     COUNTER(captures_skipped, "captures_skipped_total",
             "Optional checkpoint captures dropped for lack of admissible space.");
+    COUNTER(captures_defragmented, "captures_defragmented_total",
+            "Host releases for a capture whose StateImage fit the free bytes but no free extent.");
     COUNTER(ctx_checkpoint_retired_public, "ctx_checkpoint_retired_public_total",
             "Superseded public chain points retired beyond the per-chain bound.");
     COUNTER(ctx_checkpoint_retired_private, "ctx_checkpoint_retired_private_total",
@@ -225,6 +227,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Shared pinned Host backing capacity.");
     GAUGE(host_context_peak_occupied_bytes, "host_context_peak_bytes",
           "Host backing high-water mark, including reservations.");
+    GAUGE(host_context_largest_free_bytes, "host_context_largest_free_bytes",
+          "Largest single free extent of the Host backing.");
+    GAUGE(host_context_free_extents, "host_context_free_extents",
+          "Free extents of the Host backing; many small ones mean fragmentation.");
     GAUGE(host_state_occupied_slots, "host_state_images",
           "StateImages in the shared Host backing.");
     GAUGE(host_kv_occupied_bytes, "host_kv_used_bytes",

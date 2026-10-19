@@ -393,6 +393,8 @@ struct PhysicalUsageSnapshot {
     runtime::ContextResourceUsage capacity;
     std::size_t host_reserved_bytes      = 0;
     std::size_t host_peak_occupied_bytes = 0;
+    std::size_t host_largest_free_bytes  = 0;
+    std::size_t host_free_extents        = 0;
     std::uint32_t host_state_slots       = 0;
     std::size_t host_kv_bytes            = 0;
     // Disk tier (zero when disabled). Occupied bytes include an in-flight write.

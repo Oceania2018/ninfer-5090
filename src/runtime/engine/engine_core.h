@@ -1260,12 +1260,13 @@ private:
         const auto usage = instance_.program->physical_usage();
         std::fprintf(stderr,
                      "[cache-diag] req=%llu frontier=%u %s short{state=%u main=%u backend=%u "
-                     "host=%zu} need_host=%zu host_free=%zu demand_reused=%d last=%llu\n",
+                     "host=%zu} need_host=%zu host_free=%zu host_largest=%zu demand_reused=%d "
+                     "last=%llu\n",
                      static_cast<unsigned long long>(request->id), capture.frontier, outcome,
                      capture.shortage.state_slots, capture.shortage.main_kv_pages,
                      capture.shortage.backend_kv_pages, capture.shortage.host_bytes,
                      capture.host_bytes, usage.capacity.host_bytes - usage.occupied.host_bytes,
-                     demand_reused, last_demand);
+                     usage.host_largest_free_bytes, demand_reused, last_demand);
     }
 
     bool prepare_semantic_capture(const std::shared_ptr<Request>& request) {
@@ -1287,7 +1288,7 @@ private:
                 capture->frontier,
                 input_capture && !capture->shortage.main_kv_pages &&
                     !capture->shortage.backend_kv_pages,
-                input_capture);
+                input_capture, request->id);
             if (!decision || decision->frontier != capture->frontier) {
                 decision.emplace(
                     CaptureDecision{*request->sequence, capture->frontier,
@@ -1309,6 +1310,23 @@ private:
                         decision.reset();
                         return true;
                     }
+                }
+            }
+            // Free bytes can cover the StateImage while no single free extent does. Releasing
+            // by the free-byte deficit then frees nothing, so release a whole image's worth of
+            // admissible victims until an extent forms or nothing admissible is left.
+            const auto current = instance_.program->physical_usage();
+            if (capture->host_bytes && capture->host_bytes <= current.capacity.host_bytes &&
+                capture->host_bytes <= current.capacity.host_bytes - current.occupied.host_bytes &&
+                current.host_largest_free_bytes < capture->host_bytes) {
+                const auto freed = resources_.reclaim(
+                    *instance_.program, ContextResourceUsage{.host_bytes = capture->host_bytes},
+                    {}, decision->reclaim);
+                if (freed == ReclaimProgress::Transferring) { return false; }
+                if (freed == ReclaimProgress::Changed) {
+                    ++cumulative_stats_.captures_defragmented;
+                    scheduler_.capacity_released();
+                    continue;
                 }
             }
             const auto progress =

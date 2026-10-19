@@ -151,6 +151,8 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         out.capacity.host_bytes      = host_context_arena->capacity_bytes();
         out.host_reserved_bytes      = host_context_arena->reserved_bytes();
         out.host_peak_occupied_bytes = host_context_arena->peak_occupied_bytes();
+        out.host_largest_free_bytes  = host_context_arena->largest_free_bytes();
+        out.host_free_extents        = host_context_arena->free_extent_count();
     }
     if (disk_store) {
         out.disk_occupied_bytes = disk_store->occupied_bytes();

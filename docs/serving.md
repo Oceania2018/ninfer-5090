@@ -982,10 +982,12 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
+| `ninfer_host_context_largest_free_bytes`, `ninfer_host_context_free_extents` | Largest single free extent and free extent count; a StateImage needs one extent, so free bytes alone can overstate room |
 | `ninfer_disk_context_{capacity,used}_bytes`, `ninfer_disk_context_records` | Disk tier occupancy; capacity is 0 when the tier is off |
 | `ninfer_disk_context_{writes,write_bytes,writes_discarded,restores,restore_bytes,evictions,io_errors}_total` | Write-behind copies (discarded when a copied Host replica changed or I/O failed), rebuilds into Host, LRU evictions and I/O failures |
 | `ninfer_disk_context_restores_declined_{resident,busy,cost,host}_total` | Admission evaluations whose deepest disk match was not restored: a resident source was as deep, another restore was in flight, recomputing was cheaper, or Host room could not be made |
 | `ninfer_captures_skipped_total` | Optional checkpoint captures dropped because no admissible space could be reclaimed |
+| `ninfer_captures_defragmented_total` | Host releases for a capture whose StateImage fit the free bytes but no single free extent |
 | `ninfer_ctx_checkpoint_retired_{public,private}_total`, `ninfer_ctx_checkpoint_boosted_capture_admissions_total` | Request-chain bounding (`--ctx-checkpoints`): retired superseded or dead chain points, and capture admissions that inherited the extended point's demand |
 | `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |

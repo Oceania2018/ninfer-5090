@@ -180,6 +180,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
     snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
+    snapshot.host_context_largest_free_bytes  = physical.host_largest_free_bytes;
+    snapshot.host_context_free_extents        = physical.host_free_extents;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
     snapshot.disk_context_occupied_bytes      = physical.disk_occupied_bytes;
     snapshot.disk_context_capacity_bytes      = physical.disk_capacity_bytes;

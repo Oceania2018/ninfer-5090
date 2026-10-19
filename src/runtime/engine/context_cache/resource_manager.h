@@ -577,11 +577,27 @@ public:
         }
     }
 
+    // request_id names the capturing request. A capture is decided before its own request's
+    // commit is observed, so when another request already crossed the same prefix, this
+    // crossing is the second one: an agent task's next step capturing what its previous step
+    // left behind. Without it, that step's points carry no demand under a full Host, the step
+    // after misses, and the task never earns the demand it would have shown.
     [[nodiscard]] Admission capture_admission(Program&, OwnerToken owner, const Base& base,
                                               std::uint32_t frontier,
                                               bool inherit_private = true,
-                                              bool input_capture   = false) const {
-        auto demand = demand_priority(base.prefix_shortlist_key(frontier));
+                                              bool input_capture   = false,
+                                              std::optional<std::uint64_t> request_id = {}) const {
+        const auto key = base.prefix_shortlist_key(frontier);
+        auto demand    = demand_priority(key);
+        if (!demand.reused && key && request_id) {
+            const auto seen = std::find_if(demand_.begin(), demand_.end(), [&](const auto& entry) {
+                return entry.key == *key && entry.request_id != 0 &&
+                       entry.request_id != *request_id;
+            });
+            if (seen != demand_.end()) {
+                demand = {.reused = true, .last_demand = seen->observed_at};
+            }
+        }
         // Extending the non-root public point this request resumed from is the chain's next
         // step: in an agent loop it is what the next request resumes from. It carries the
         // adopted point's demand instead of the one-step coverage budget, which a full Host of

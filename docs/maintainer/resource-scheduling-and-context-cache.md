@@ -276,7 +276,9 @@ Native 在提交前准备请求元数据，检查并利用退休旧点可释放�
 另有最多 256 项的需求摘要，记录有限候选位置的 digest、frontier、identity tag 和实际请求观察。
 成功采用非零跨请求来源时，记录该精确采用位置的重复需求；新 prefill **提交并跨过候选位置**时
 记录计算需求，同一请求同一位置只记一次。两个不同请求的真实计算也能证明重复需求，即使此前
-没有物理副本可命中，后续捕获仍能取得该位置的复用资格。
+没有物理副本可命中，后续捕获仍能取得该位置的复用资格。捕获准入早于本请求自己的提交观察，
+因此 Engine 传入申请请求的 id：摘要里已有**另一个**请求跨过同一位置时，这次捕获本身就是第二次
+跨越，按重复需求准入。Agent 任务的下一步因此能保存上一步留下的共享位置，而不必等到第三步。
 Rendering、候选查询、轮询、自己的 Snapshot/Replay 恢复和单纯保存不产生观察；摘要命中只影响
 保留与准入，不增加 cache-hit 或 reused-token 统计，也不持有 State/KV。输入恢复点因这份真实
 重复需求证据提升私有 owner 时，同时把证明位置设为该输入点。
@@ -350,7 +352,13 @@ Host 与 Device 分步删除共用预算，累计已经牺牲的恢复覆盖；�
 
 Host 先释放安全的重复副本，再对有限物理动作作完整预检：实际释放并集足额，且联合持有者都能
 被本次申请替换，才执行删除。Shared 引用的名义大小不重复累加。预检后 allocator 仍须满足
-完整 StateImage 与连续 extent geometry；分配失败可放弃保存，已完成删除不回滚。
+完整 StateImage 与连续 extent geometry；已完成删除不回滚。
+
+Host backing 按两端放置：StateImage 尺寸统一，从顶端分配（`HostPlacement::High`），KV run 从底端
+分配。释放的 image 留下的洞正好容纳下一个 image，不会被夹在 KV run 之间切碎。空闲字节足够而
+最大连续 extent 仍小于 StateImage 时，按字节差额回收不会删除任何内容；捕获改为按一个完整
+image 的大小继续回收可准入的受害者，直到形成足够的 extent 或无可准入内容，然后才跳过
+（`ninfer_captures_defragmented_total`、`ninfer_host_context_largest_free_bytes`）。
 
 <a id="lineage"></a>
 ### 7.4 Request-chain retention (CUA)
