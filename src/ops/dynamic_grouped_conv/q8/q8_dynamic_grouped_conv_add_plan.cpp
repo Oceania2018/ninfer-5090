@@ -50,6 +50,11 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(plan.workspace_bytes);
     Tensor projected(storage.data, DType::BF16, {5120, x.ne[1], x.ne[2]});
+    if (weight.qtype == QType::NVFP4) {
+        nvfp4_dynamic_grouped_conv_add_materialized_launch(x, weight, base, delta, residual,
+                                                           projected, stream);
+        return;
+    }
     q8_dynamic_grouped_conv_add_materialized_launch(plan.schedule, x, weight, base, delta, residual,
                                                     projected, stream);
 }

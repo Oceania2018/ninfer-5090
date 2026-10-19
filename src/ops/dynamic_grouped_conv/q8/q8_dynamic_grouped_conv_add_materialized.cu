@@ -6,6 +6,7 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include <cuda_bf16.h>
 #include <array>
 #include <algorithm>
@@ -71,6 +72,16 @@ __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat1
                  residual);
 }
 
+void launch_finish(const Tensor& x, const Tensor& base, const Tensor& delta, Tensor& residual,
+                   const Tensor& projected, cudaStream_t stream) {
+    const dim3 grid((kRows + 255) / 256, x.ne[1] * x.ne[2]);
+    finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
+                                            static_cast<const __nv_bfloat16*>(base.data),
+                                            static_cast<const __nv_bfloat16*>(delta.data),
+                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weight& weight,
                   const Tensor& base, const Tensor& delta, Tensor& residual, Tensor& projected,
                   cudaStream_t stream) {
@@ -87,12 +98,7 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
     }
-    const dim3 grid((kRows + 255) / 256, tokens);
-    finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
-                                            static_cast<const __nv_bfloat16*>(base.data),
-                                            static_cast<const __nv_bfloat16*>(delta.data),
-                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    launch_finish(x, base, delta, residual, projected, stream);
 }
 } // namespace
 
@@ -102,5 +108,18 @@ void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule sc
                                                      Tensor& residual, Tensor& projected,
                                                      cudaStream_t stream) {
     materialized(schedule, x, weight, base, delta, residual, projected, stream);
+}
+
+// NVFP4 projections (draft MLP re-encoded for 16 GB cards) carry no activation divisor: the
+// A16 NVFP4 linear materializes the same BF16 projection, then the shared finish pass runs.
+void nvfp4_dynamic_grouped_conv_add_materialized_launch(const Tensor& x, const Weight& weight,
+                                                        const Tensor& base, const Tensor& delta,
+                                                        Tensor& residual, Tensor& projected,
+                                                        cudaStream_t stream) {
+    const int tokens  = x.ne[1] * x.ne[2];
+    const Tensor flat = x.view({x.ne[0], tokens});
+    Tensor result     = projected.view({kRows, tokens});
+    nvfp4_dispatch(flat, weight, result, LinearPolicy::A16Only, nullptr, stream);
+    launch_finish(x, base, delta, residual, projected, stream);
 }
 } // namespace ninfer::ops::detail

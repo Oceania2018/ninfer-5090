@@ -3,6 +3,7 @@
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <array>
 #include <cmath>
@@ -59,6 +60,15 @@ std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
 }
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
+    if (weight.qtype == QType::NVFP4) {
+        // Both finish shapes (attention 4096, MLP 17408) have A16 NVFP4 linears; no divisor.
+        if (weight.n != kHidden || weight.k != input_rows) {
+            throw std::invalid_argument(
+                "linear dynamic grouped conv add: NVFP4 projection must be [5120,C]");
+        }
+        (void)detail::validate_nvfp4_weight(weight, kAddOp);
+        return;
+    }
     const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
@@ -95,10 +105,11 @@ bool overlaps(const Range& lhs, const Range& rhs) {
 void require_finish_nonoverlap(const Tensor& x, const Weight& projection_weight,
                                const Tensor& base_kernel, const Tensor& finish_delta,
                                const Tensor& residual, const WorkspaceArena& workspace) {
-    const std::size_t code_bytes =
+    const bool nvfp4 = projection_weight.qtype == QType::NVFP4;
+    const std::size_t elements =
         static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0]);
-    const std::size_t scale_bytes = static_cast<std::size_t>(kHidden) *
-                                    static_cast<std::size_t>(x.ne[0] / 32) * sizeof(std::uint16_t);
+    const std::size_t code_bytes  = nvfp4 ? elements / 2 : elements;
+    const std::size_t scale_bytes = nvfp4 ? elements / 16 : elements / 32 * sizeof(std::uint16_t);
     const std::array<Range, 7> ranges{{
         {x.data, x.bytes(), "x"},
         {projection_weight.qdata, code_bytes, "projection codes"},
