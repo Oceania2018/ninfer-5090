@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# CUDA 13.0 matches the R580 driver (RTX 4090 host). A 13.1 image needs NVIDIA_DISABLE_REQUIRE=1
-# to start on R580, because nvidia-container-cli enforces NVIDIA_REQUIRE_CUDA=cuda>=13.1.
-FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS build
+# CUDA 13.1 is the validated sm_120a toolkit (RTX 5060 Ti / 5090).
+FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -31,7 +30,7 @@ RUN cmake -S . -B /build -G Ninja \
         -DNINFER_BUILD_BENCHMARKS=OFF \
     && cmake --build /build --parallel ${BUILD_JOBS} --target ninfer ninfer-serve
 
-FROM nvidia/cuda:13.0.2-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
