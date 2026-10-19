@@ -169,12 +169,17 @@ class ChatTemplates(unittest.TestCase):
         history = [message("user", "question"), message("assistant", "answer prefix")]
         for version in TEMPLATES:
             with self.subTest(template=version):
+                # qwen3_8 opens a continued turn with the non-thinking generation prompt's empty
+                # think block; without it the model ends the turn immediately.
+                opener = "<think>\n\n</think>\n\n" if version == "qwen3_8" else ""
                 text = self.render(
                     version, history, continue_final_message=True, enable_thinking=False
                 )
                 self.assertEqual(
                     text,
-                    "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\nanswer prefix",
+                    "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n"
+                    + opener
+                    + "answer prefix",
                 )
                 literal = [
                     message("user", "question"),
@@ -186,7 +191,7 @@ class ChatTemplates(unittest.TestCase):
                         literal,
                         continue_final_message=True,
                         enable_thinking=False,
-                    ).endswith("<|im_start|>assistant\nprefix </think> text")
+                    ).endswith("<|im_start|>assistant\n" + opener + "prefix </think> text")
                 )
 
     def test_cpp_matches_independent_renderer(self):

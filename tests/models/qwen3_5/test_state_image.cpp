@@ -308,8 +308,10 @@ void test_shared_host_capacity() {
                state.view(*source).data == original_bytes,
            "KV transfer cancellation retains the pinned State source");
     expect(state.release(*source), "shared Host state release");
+    // StateImages take HostPlacement::High, so the image occupied the top half of the backing
+    // and a backing-wide KV run starts one image below it.
     auto all_kv = kv.allocate(page, pages_per_image * 2);
-    expect(all_kv && kv.view(*all_kv).data() == original_bytes &&
+    expect(all_kv && kv.view(*all_kv).data() + image_bytes == original_bytes &&
                backing.occupied_bytes() == backing.capacity_bytes(),
            "KV reuses the exact physical extent previously occupied by State");
     all_kv->publish();
@@ -317,9 +319,10 @@ void test_shared_host_capacity() {
     auto parts       = kv.split(std::move(*all_kv), pages_per_image);
     expect(!stale.valid() && backing.live_bytes() == image_bytes * 2,
            "KV split invalidates old views while keeping unique byte accounting");
+    const std::byte* released_kv_bytes = kv.view(parts.first).data();
     (void)parts.first.release();
     auto recovered = state.allocate();
-    expect(recovered && state.view(*recovered).data == original_bytes &&
+    expect(recovered && state.view(*recovered).data == released_kv_bytes &&
                backing.occupied_bytes() == backing.capacity_bytes(),
            "State reuses the exact physical extent released by split KV");
     expect(state.release(*recovered), "shared Host recovered state release");
